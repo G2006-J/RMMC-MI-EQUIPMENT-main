@@ -23,7 +23,7 @@ export default function PrivacyNoticePage() {
         <p>PLACEHOLDER RETENTION SCHEDULE: read notifications are automatically deleted after 90 days. Account, borrowing, and audit records do not currently have an automatic deletion schedule; the school must define and publish their retention periods.</p>
 
         <h2>Questions or deletion requests</h2>
-        <p>Contact your school’s designated privacy officer or system administrator at the contact address the school adds here. An approved anonymization request clears profile and borrower personal fields and the stored photo path; borrowing and audit history remains. The administrator removes the photo file separately through storage.</p>
+        <p>Contact your school’s designated privacy officer or system administrator at the contact address the school adds here. Account or data-retention requests are handled through the school’s approved privacy process. Borrowing and audit records are retained according to the school’s published retention schedule.</p>
 
         <Link className="button-secondary" href="/">Back to sign in</Link>
       </div>

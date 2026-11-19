@@ -10,6 +10,23 @@ declare
   v_category_id bigint;
   v_equipment_id bigint;
 begin
+  if to_regclass('public.profiles') is null
+    or to_regclass('public.borrowers') is null
+    or to_regclass('public.account_access_audit_log') is null then
+    raise exception 'Account and account-audit tables must remain in Supabase.';
+  end if;
+  if not has_column_privilege('authenticated', 'public.borrowers', 'user_id', 'select') then
+    raise exception 'Authenticated borrower queries require the linked user_id column grant.';
+  end if;
+  if has_function_privilege('authenticated', 'public.admin_deactivate_borrower_account(uuid)', 'execute')
+    or has_function_privilege('authenticated', 'public.admin_anonymize_inactive_borrower(uuid)', 'execute')
+    or has_function_privilege('authenticated', 'public.admin_update_profile_access(uuid, text, text)', 'execute') then
+    raise exception 'Authenticated administrators must not be able to deactivate, anonymize, or delete accounts.';
+  end if;
+  if not has_function_privilege('authenticated', 'public.set_profile_role(uuid, text)', 'execute') then
+    raise exception 'Authenticated administrators must retain role-assignment access.';
+  end if;
+
   select p.id into v_admin
   from public.profiles p
   join auth.users u on u.id = p.id
@@ -59,60 +76,100 @@ declare
   v_admin uuid := current_setting('role_permissions.admin_id')::uuid;
   v_staff_email text := current_setting('role_permissions.staff_email');
   v_rows integer;
+  v_custodian_equipment_id bigint;
   v_unit_id bigint;
   v_second_unit_id bigint;
   v_borrowing_id bigint;
   v_item_id bigint;
+  v_report_id bigint;
   v_asset_tag text;
   v_admin_count integer;
   v_error text;
+  v_feedback_thread_id bigint;
+  v_thread_to_delete_id bigint;
+  v_feedback_reply_id bigint;
 begin
-  update public.equipment set description = 'custodian write must be denied'
+  if not exists (
+    select 1 from public.borrowers where user_id = v_staff
+  ) then
+    raise exception 'An equipment custodian could not read linked borrower records.';
+  end if;
+
+  update public.equipment set description = 'custodian can edit equipment'
   where equipment_id = v_equipment_id;
   get diagnostics v_rows = row_count;
-  if v_rows <> 0 then raise exception 'A property custodian updated the equipment catalog directly.'; end if;
+  if v_rows <> 1 then raise exception 'A property custodian could not edit equipment.'; end if;
 
-  begin
-    insert into public.equipment (asset_code, equipment_name, category_id, quantity)
-    values ('CUSTODIAN-INSERT-MUST-FAIL', 'Unauthorized catalog insert',
-      (select category_id from public.equipment where equipment_id = v_equipment_id), 1);
-    raise exception 'A property custodian inserted equipment directly.';
-  exception when insufficient_privilege then null;
-  end;
+  insert into public.equipment (asset_code, equipment_name, category_id, quantity)
+  values ('CUSTODIAN-' || replace(gen_random_uuid()::text, '-', ''), 'Custodian-created equipment',
+    (select category_id from public.equipment where equipment_id = v_equipment_id), 1)
+  returning equipment_id into v_custodian_equipment_id;
+  if not exists (
+    select 1 from public.equipment
+    where equipment_id = v_custodian_equipment_id and equipment_name = 'Custodian-created equipment'
+  ) then raise exception 'A property custodian could not add equipment.'; end if;
+  perform public.delete_equipment(v_custodian_equipment_id);
 
   delete from public.equipment where equipment_id = v_equipment_id;
   get diagnostics v_rows = row_count;
   if v_rows <> 0 then raise exception 'A property custodian deleted catalog equipment directly.'; end if;
 
-  if exists (
-    select 1 from pg_policies
+  if (
+    select count(*) from pg_policies
     where schemaname = 'storage' and tablename = 'objects'
       and policyname in (
         'equipment managers upload images',
         'equipment managers update images',
         'equipment managers delete images'
       )
-  ) or (
-    select count(*) from pg_policies
+  ) <> 3 or exists (
+    select 1 from pg_policies
     where schemaname = 'storage' and tablename = 'objects'
       and policyname in (
         'admins upload equipment images',
         'admins update equipment images',
         'admins delete equipment images'
       )
-      and coalesce(qual, '') || coalesce(with_check, '') like '%is_equipment_admin_user%'
+  ) or (
+    select count(*) from pg_policies
+    where schemaname = 'storage' and tablename = 'objects'
+      and policyname in (
+        'equipment managers upload images',
+        'equipment managers update images',
+        'equipment managers delete images'
+      )
+      and coalesce(qual, '') || coalesce(with_check, '') like '%is_equipment_manager_user%'
   ) <> 3 then
-    raise exception 'Equipment image write policies must be admin-only.';
+    raise exception 'Equipment image write policies must be available to active equipment managers.';
   end if;
 
-  begin
-    perform public.delete_equipment(v_equipment_id);
-    raise exception 'A property custodian called delete_equipment.';
-  exception when raise_exception then
-    get stacked diagnostics v_error = message_text;
-    if v_error = 'A property custodian called delete_equipment.' then raise; end if;
-    if v_error not like '%Only administrators can remove equipment%' then raise; end if;
-  end;
+  perform set_config('request.jwt.claim.sub', v_staff::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object(
+    'sub', v_staff, 'email', v_staff_email, 'role', 'authenticated'
+  )::text, true);
+  insert into public.feedback_threads (author_id, author_name, title, category, message)
+  values (v_staff, 'Permission Test Borrower', 'Custodian comment deletion test', 'issue', 'Test thread.')
+  returning id into v_feedback_thread_id;
+  insert into public.feedback_replies (thread_id, author_id, author_name, message)
+  values (v_feedback_thread_id, v_staff, 'Permission Test Borrower', 'Test comment.')
+  returning id into v_feedback_reply_id;
+  insert into public.feedback_threads (author_id, author_name, title, category, message)
+  values (v_staff, 'Permission Test Borrower', 'Custodian thread deletion test', 'suggestion', 'Thread to delete.')
+  returning id into v_thread_to_delete_id;
+  insert into public.feedback_replies (thread_id, author_id, author_name, message)
+  values (v_thread_to_delete_id, v_staff, 'Permission Test Borrower', 'Cascade test comment.');
+
+  perform set_config('request.jwt.claim.sub', v_custodian::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object(
+    'sub', v_custodian, 'role', 'authenticated'
+  )::text, true);
+  delete from public.feedback_replies where id = v_feedback_reply_id;
+  get diagnostics v_rows = row_count;
+  if v_rows <> 1 then raise exception 'A property custodian could not delete a feedback comment.'; end if;
+  delete from public.feedback_threads where id = v_thread_to_delete_id;
+  get diagnostics v_rows = row_count;
+  if v_rows <> 1 then raise exception 'A property custodian could not delete a feedback thread.'; end if;
+
   begin
     perform public.convert_equipment_to_unit_tracking(v_equipment_id, '[]'::jsonb);
     raise exception 'A property custodian converted catalog equipment.';
@@ -148,6 +205,64 @@ begin
     jsonb_build_array(jsonb_build_object('borrowing_item_id', v_item_id, 'unit_id', v_unit_id)),
     'good'
   );
+  perform set_config('request.jwt.claim.sub', v_staff::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object(
+    'sub', v_staff, 'email', v_staff_email, 'role', 'authenticated'
+  )::text, true);
+  v_report_id := public.report_borrowing_item_condition(
+    v_item_id, 'damage', 'Borrower-reported damage for permission test', 1
+  );
+  if not exists (
+    select 1 from public.damage_loss_reports
+    where report_id = v_report_id and reporter_id = v_staff
+      and report_type = 'damage'
+      and description = 'Borrower-reported damage for permission test'
+      and resolution_status = 'open'
+  ) then raise exception 'A borrower could not submit a damage report for their active item.'; end if;
+  begin
+    perform public.report_borrowing_item_condition(
+      v_item_id, 'damage', 'Duplicate open report', 1
+    );
+    raise exception 'A borrower created a duplicate unresolved report.';
+  exception when raise_exception then
+    get stacked diagnostics v_error = message_text;
+    if v_error = 'A borrower created a duplicate unresolved report.' then raise; end if;
+    if v_error not like '%unresolved report of this type already exists%' then raise; end if;
+  end;
+
+  perform set_config('request.jwt.claim.sub', v_custodian::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object(
+    'sub', v_custodian, 'role', 'authenticated'
+  )::text, true);
+  if not exists (
+    select 1
+    from public.list_damage_loss_reports()
+    where report_id = v_report_id
+      and description = 'Borrower-reported damage for permission test'
+  ) then raise exception 'A manager could not load the borrower comment in damage and loss reports.'; end if;
+  begin
+    perform public.complete_equipment_unit_return(v_item_id, 'good', v_asset_tag, null, null);
+    raise exception 'A property custodian returned equipment without a borrower request.';
+  exception when raise_exception then
+    get stacked diagnostics v_error = message_text;
+    if v_error = 'A property custodian returned equipment without a borrower request.' then raise; end if;
+    if v_error not like '%borrower must request a return%' then raise; end if;
+  end;
+
+  perform set_config('request.jwt.claim.sub', v_staff::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object(
+    'sub', v_staff, 'email', v_staff_email, 'role', 'authenticated'
+  )::text, true);
+  perform public.request_equipment_return(v_borrowing_id);
+
+  perform set_config('request.jwt.claim.sub', v_custodian::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object(
+    'sub', v_custodian, 'role', 'authenticated'
+  )::text, true);
+  if not exists (
+    select 1 from public.return_requests
+    where borrowing_id = v_borrowing_id and status = 'pending'
+  ) then raise exception 'A property custodian could not read the borrower return request.'; end if;
   perform public.complete_equipment_unit_return(v_item_id, 'good', v_asset_tag, null, null);
   if not exists (
     select 1 from public.borrowing_items
@@ -178,7 +293,7 @@ begin
   exception when raise_exception then
     get stacked diagnostics v_error = message_text;
     if v_error = 'Staff called delete_equipment.' then raise; end if;
-    if v_error not like '%Only administrators can remove equipment%' then raise; end if;
+    if v_error not like '%Only administrators and property custodians can remove equipment%' then raise; end if;
   end;
   begin
     perform public.convert_equipment_to_unit_tracking(v_equipment_id, '[]'::jsonb);
@@ -244,14 +359,15 @@ begin
     if v_error = 'Staff called set_profile_role.' then raise; end if;
     if v_error not like '%Only an active administrator%' then raise; end if;
   end;
-  begin
-    perform public.admin_update_profile_access(v_staff, 'admin', 'active');
-    raise exception 'Staff called admin_update_profile_access.';
-  exception when raise_exception then
-    get stacked diagnostics v_error = message_text;
-    if v_error = 'Staff called admin_update_profile_access.' then raise; end if;
-    if v_error not like '%Only an active administrator%' then raise; end if;
-  end;
+  perform set_config('request.jwt.claim.sub', v_custodian::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object(
+    'sub', v_custodian, 'role', 'authenticated'
+  )::text, true);
+  perform public.delete_equipment(v_equipment_id);
+  if not exists (
+    select 1 from public.equipment
+    where equipment_id = v_equipment_id and deleted_at is not null and deleted_by = v_custodian
+  ) then raise exception 'A property custodian could not remove inactive equipment.'; end if;
 
   perform set_config('request.jwt.claim.sub', v_admin::text, true);
   perform set_config('request.jwt.claims', jsonb_build_object(
@@ -259,15 +375,6 @@ begin
   )::text, true);
   select count(*) into v_admin_count from public.profiles
   where role = 'admin' and account_status = 'active';
-  begin
-    perform public.admin_update_profile_access(v_admin, 'staff', 'inactive');
-    raise exception 'An admin changed their own role or status.';
-  exception when raise_exception then
-    get stacked diagnostics v_error = message_text;
-    if v_error = 'An admin changed their own role or status.' then raise; end if;
-    if v_admin_count = 1 and v_error not like '%last active administrator%' then raise; end if;
-    if v_admin_count > 1 and v_error not like '%cannot change their own role or account status%' then raise; end if;
-  end;
   begin
     perform public.set_profile_role(v_admin, 'property_custodian');
     raise exception 'An admin demoted themselves.';
@@ -284,41 +391,11 @@ begin
   perform public.set_profile_role(v_staff, 'property_custodian');
   if not exists (
     select 1 from public.profiles p join public.borrowers b on b.user_id = p.id
-    where p.id = v_staff and p.role = 'property_custodian' and b.status = p.account_status
+    where p.id = v_staff and p.role = 'property_custodian'
+      and p.account_status = 'active' and b.status = 'active'
   ) then raise exception 'set_profile_role must keep the linked borrower status synchronized.'; end if;
-  perform public.admin_update_profile_access(v_staff, 'staff', 'inactive');
-  if not exists (
-    select 1 from public.profiles p join public.borrowers b on b.user_id = p.id
-    where p.id = v_staff and p.role = 'staff' and p.account_status = 'inactive' and b.status = 'inactive'
-  ) then raise exception 'admin_update_profile_access must synchronize the borrower status.'; end if;
 end;
 $$;
 
-reset role;
-
-update public.profiles
-set full_name = 'Anonymized account', email = ''
-where id = current_setting('role_permissions.staff_id')::uuid;
-select set_config('request.jwt.claim.sub', current_setting('role_permissions.admin_id'), true);
-select set_config('request.jwt.claims', jsonb_build_object(
-  'sub', current_setting('role_permissions.admin_id'),
-  'role', 'authenticated'
-)::text, true);
-set local role authenticated;
-do $$
-declare
-  v_staff uuid := current_setting('role_permissions.staff_id')::uuid;
-  v_error text;
-begin
-  begin
-    perform public.admin_update_profile_access(v_staff, 'staff', 'active');
-    raise exception 'An anonymized account had its access changed.';
-  exception when raise_exception then
-    get stacked diagnostics v_error = message_text;
-    if v_error = 'An anonymized account had its access changed.' then raise; end if;
-    if v_error not like '%Anonymized accounts cannot have their access changed%' then raise; end if;
-  end;
-end;
-$$;
 reset role;
 rollback;

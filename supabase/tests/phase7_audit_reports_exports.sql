@@ -100,15 +100,12 @@ begin
   v_result:=public.import_equipment_csv(jsonb_build_array(jsonb_build_object('asset_code',v_code||'-import','equipment_name','Imported','category_name',(select category_name from public.categories where category_id=v_category),'tracking_mode','quantity','quantity','1')),false);
   if not (v_result->>'ok')::boolean or (select count(*) from public.phase7_audit_log where event_type='csv_import_succeeded' and actor_id=v_admin and row_count=1 and success)<>1 then raise exception 'Successful import must be logged exactly once.'; end if;
 
-  perform public.admin_update_profile_access(v_staff,'property_custodian','inactive');
-  if (select count(*) from public.phase7_audit_log where event_type='profile_access_changed' and entity_id=v_staff::text and actor_id=v_admin)<>1 then raise exception 'Admin profile-access RPC must audit the role and status update once.'; end if;
+  perform public.set_profile_role(v_staff,'property_custodian');
+  if (select count(*) from public.phase7_audit_log where event_type='profile_access_changed' and entity_id=v_staff::text and actor_id=v_admin)<>1 then raise exception 'Admin role update must create one profile-access audit event.'; end if;
   perform set_config('request.jwt.claim.sub','',true);
   perform set_config('request.jwt.claims','{}',true);
-  update public.profiles set role='staff',account_status='active' where id=v_staff;
-  if (select count(*) from public.phase7_audit_log where event_type='profile_access_changed' and entity_id=v_staff::text and actor_id is null and source='direct_sql' and before_values->>'role'='property_custodian' and after_values->>'role'='staff' and before_values->>'account_status'='inactive' and after_values->>'account_status'='active')<>1 then raise exception 'Direct SQL role and account-status changes must be audited once with null actor and direct_sql source.'; end if;
-  perform set_config('request.jwt.claim.sub',v_admin::text,true);
-  perform set_config('request.jwt.claims',jsonb_build_object('sub',v_admin)::text,true);
-  perform public.admin_update_profile_access(v_staff,'staff','active');
+  update public.profiles set role='staff' where id=v_staff;
+  if (select count(*) from public.phase7_audit_log where event_type='profile_access_changed' and entity_id=v_staff::text and actor_id is null and source='direct_sql' and before_values->>'role'='property_custodian' and after_values->>'role'='staff' and before_values->>'account_status'='active' and after_values->>'account_status'='active')<>1 then raise exception 'Direct SQL role updates must be audited once with null actor and direct_sql source.'; end if;
 
   insert into public.equipment(asset_code,equipment_name,category_id,quantity,availability_status)
     values(v_code||'-report','Phase 7 report fixture',v_category,2,'available') returning equipment_id into v_equipment;

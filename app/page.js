@@ -38,7 +38,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createClient as createAuthClient } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/client";
 import { DEPARTMENTS } from "@/lib/departments.mjs";
-import { formatManilaDate, formatManilaDateTime } from "@/lib/datetime.mjs";
+import { getBorrowerActivityItems } from "@/lib/borrower-activity.mjs";
+import { displayEquipmentCategory, isHiddenEquipmentCategory } from "@/lib/equipment-categories.mjs";
+import {
+  formatManilaDate,
+  formatManilaDateTime,
+  isManilaDateTimeCurrent,
+  manilaDateKey,
+} from "@/lib/datetime.mjs";
 import InstallAppButton from "./install-app-button";
 import { AuditLogWorkspace, OverviewReportCards, OverviewStatistics, ReportsWorkspace } from "./phase7-workspaces";
 import { getErrorMessage, PENDING_BORROWER_MESSAGE } from "@/lib/backend-error.mjs";
@@ -226,6 +233,17 @@ function SignIn({ supabase, configError }) {
       return;
     }
 
+    if (mode === "reset") {
+      if (otpCooldown > 0) throw new Error(`Please wait ${otpCooldown} seconds before requesting another code.`);
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
+        redirectTo: `${window.location.origin}/reset-password`,
+      });
+      if (resetError) throw resetError;
+      setOtpCooldown(60);
+      setNotice("If an account exists for that address, a password reset code has been sent.");
+      return;
+    }
+
     await handleSendOtp();
   }
 
@@ -291,18 +309,32 @@ function SignIn({ supabase, configError }) {
           setNotice(`A verification code was sent to ${email}.`);
         }
       } else if (mode === "reset") {
-        const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
-          redirectTo: `${window.location.origin}/reset-password`,
-        });
-        if (resetError) throw resetError;
-        setNotice("If an account exists for that address, a password reset link is on its way.");
+        if (!isCodeSent) {
+          const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
+            redirectTo: `${window.location.origin}/reset-password`,
+          });
+          if (resetError) throw resetError;
+          setOtpCooldown(60);
+          setIsCodeSent(true);
+          setNotice("If an account exists for that address, a 6-digit password reset code has been sent.");
+        } else {
+          const { error: verificationError } = await supabase.auth.verifyOtp({
+            email: email.trim().toLowerCase(),
+            token,
+            type: "recovery",
+          });
+          if (verificationError) throw verificationError;
+          window.location.assign("/reset-password");
+        }
       }
     } catch (submissionError) {
       const message = getErrorMessage(submissionError);
       if (mode === "signin") {
         setError("Unable to sign in with those details. Check your credentials or verification code and try again.");
       } else if (mode === "reset") {
-        setError("If an account exists for that address, a password reset email may be sent. Please try again later.");
+        setError(isCodeSent
+          ? "The reset code is invalid or expired. Request a new code and try again."
+          : "If an account exists for that address, a password reset email may be sent. Please try again later.");
       } else {
         setError(mode === "signup" && isCodeSent ? `Invalid or expired code: ${message}` : message);
       }
@@ -320,7 +352,9 @@ function SignIn({ supabase, configError }) {
       if (!supabase) throw new Error(configError);
       await handleResendCode();
     } catch (submissionError) {
-      setError(`Error sending code: ${getErrorMessage(submissionError)}`);
+      setError(mode === "reset"
+        ? "If an account exists for that address, a reset code may be sent. Please try again later."
+        : `Error sending code: ${getErrorMessage(submissionError)}`);
     } finally {
       setBusy(false);
     }
@@ -365,7 +399,7 @@ function SignIn({ supabase, configError }) {
           <div className="auth-heading">
             <p className="eyebrow">{mode === "signup" ? isCodeSent ? "Verify your email" : "Get started" : mode === "reset" ? "Account recovery" : isCodeSent ? "Check your inbox" : "Welcome back"}</p>
             <h2>{mode === "signup" ? isCodeSent ? "Enter your verification code" : "Create your account" : mode === "reset" ? "Reset your password" : isCodeSent ? "Enter your sign-in code" : "Sign in to your workspace"}</h2>
-            <p>{mode === "signup" ? isCodeSent ? `Enter the verification code sent to ${email}.` : "Sign up with your email address. After verifying it, an administrator or property custodian must approve your account before you can borrow equipment." : mode === "reset" ? "We’ll email you a secure password reset link." : isCodeSent ? `Enter the verification code sent to ${email} after your password was confirmed.` : "Enter your email and password. We’ll send a verification code after your credentials are confirmed."}</p>
+            <p>{mode === "signup" ? isCodeSent ? `Enter the verification code sent to ${email}.` : "Sign up with your email address. After verifying it, an administrator or property custodian must approve your account before you can borrow equipment." : mode === "reset" ? isCodeSent ? `Enter the 6-digit reset code sent to ${email}.` : "We’ll email you a 6-digit password reset code." : isCodeSent ? `Enter the verification code sent to ${email} after your password was confirmed.` : "Enter your email and password. We’ll send a verification code after your credentials are confirmed."}</p>
           </div>
           <form className="auth-form" onSubmit={submit}>
             {mode === "signup" && !isCodeSent && (
@@ -376,7 +410,7 @@ function SignIn({ supabase, configError }) {
             )}
             <label>
               <span>Email</span>
-              <input type="email" autoComplete="email" autoCapitalize="none" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" disabled={isCodeSent && (mode === "signin" || mode === "signup")} required />
+              <input type="email" autoComplete="email" autoCapitalize="none" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" disabled={isCodeSent} required />
             </label>
             {mode === "signin" && !isCodeSent && (
               <label>
@@ -387,6 +421,12 @@ function SignIn({ supabase, configError }) {
             {(mode === "signin" || mode === "signup") && isCodeSent && (
               <label>
                 <span>{mode === "signup" ? "Verification code" : "One-time code"}</span>
+                <input type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} value={token} onChange={(event) => setToken(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="Enter your 6-digit code" required />
+              </label>
+            )}
+            {mode === "reset" && isCodeSent && (
+              <label>
+                <span>Password reset code</span>
                 <input type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} value={token} onChange={(event) => setToken(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="Enter your 6-digit code" required />
               </label>
             )}
@@ -443,8 +483,14 @@ function SignIn({ supabase, configError }) {
                 <button type="button" onClick={resendOtp} disabled={busy || otpCooldown > 0}>{otpCooldown > 0 ? `Resend in ${otpCooldown}s` : "Resend code"}</button>
               </div>
             )}
+            {mode === "reset" && isCodeSent && (
+              <div className="auth-options">
+                <span>Check your inbox for the reset code.</span>
+                <button type="button" onClick={resendOtp} disabled={busy || otpCooldown > 0}>{otpCooldown > 0 ? `Resend in ${otpCooldown}s` : "Resend code"}</button>
+              </div>
+            )}
             <button className="auth-submit" disabled={busy || Boolean(configError)} type="submit">
-              {busy ? "Please wait…" : mode === "signup" ? isCodeSent ? "Verify code" : "Create account" : mode === "reset" ? "Send reset link" : isCodeSent ? "Verify code" : "Continue securely"}
+              {busy ? "Please wait…" : mode === "signup" ? isCodeSent ? "Verify code" : "Create account" : mode === "reset" ? isCodeSent ? "Verify reset code" : "Send reset code" : isCodeSent ? "Verify code" : "Continue securely"}
               <ArrowUpRight size={16} />
             </button>
           </form>
@@ -482,14 +528,15 @@ function EmptyState({ title, copy, action, onAction }) {
 function EquipmentCard({ item, onBorrow, onReserve, canRequest = true }) {
   const canBorrow = ["available", "checked_out"].includes(item.status) && item.available_quantity > 0;
   const canReserve = ["available", "checked_out"].includes(item.status) && item.quantity > 0;
+  const categoryLabel = displayEquipmentCategory(item.category);
   return (
     <article className="equipment-card">
-      <div className={`equipment-art art-${(item.category || "general").toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}>
+      <div className={`equipment-art art-${(categoryLabel || "equipment").toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}>
         {item.image_url ? <img src={item.image_url} alt="" /> : <Laptop size={42} strokeWidth={1.2} />}
         <StatusPill value={item.quantity === 0 || item.available_quantity === 0 ? "out_of_stock" : item.status} />
       </div>
       <div className="card-body">
-        <div className="card-category">{item.category || "General"}</div>
+        {categoryLabel && <div className="card-category">{categoryLabel}</div>}
         <h2>{item.name}</h2>
         <div className="item-meta">
           <span>{item.asset_tag}</span><i /><span>{item.location || "Storage not set"}</span>
@@ -665,7 +712,7 @@ export default function Home() {
     }
 
     let borrowingQuery = client.from("borrowings")
-      .select("*, borrowers!inner(borrower_id, first_name, middle_name, last_name, email, department), borrowing_items(borrowing_item_id, borrowing_id, equipment_id, item_status, issued_at, returned_at, quantity, released_by, released_at, received_by, condition_at_release, release_photo_path, condition_at_return, return_photo_path, is_overdue, overdue_at, equipment(equipment_id, asset_code, equipment_name, category_id, storage_location, availability_status, tracking_mode, categories(category_name)))")
+      .select("*, borrowers!inner(borrower_id, first_name, middle_name, last_name, email, department), borrowing_items(borrowing_item_id, borrowing_id, equipment_id, item_status, issued_at, returned_at, quantity, released_by, released_at, received_by, condition_at_release, release_photo_path, condition_at_return, return_photo_path, is_overdue, overdue_at, damage_loss_reports(quantity_affected, report_type), equipment(equipment_id, asset_code, equipment_name, category_id, storage_location, availability_status, tracking_mode, categories(category_name)))")
       .order("created_at", { ascending: false }).order("borrowing_id", { ascending: false }).range(borrowingsPage * 20, borrowingsPage * 20 + 19);
     const safeBorrowingSearch = borrowingsSearch.trim().replace(/[\\%,()"]/g, "\\$&");
     if (safeBorrowingSearch) {
@@ -676,16 +723,24 @@ export default function Home() {
     }
     const scopedBorrowingQuery = isCustodianUser
       ? borrowingQuery.in("transaction_status", ["requested", "approved", "released"])
-      : borrowingQuery;
+      : isEquipmentManager
+        ? borrowingQuery
+        : borrowingQuery.in("transaction_status", ["requested", "approved", "released"]);
     const reservationQuery = client.from("reservations")
       .select("*, equipment(equipment_id, asset_code, equipment_name, categories(category_name)), borrowers(borrower_id, first_name, middle_name, last_name, email)")
       .order("created_at", { ascending: false });
     const scopedReservationQuery = isCustodianUser
       ? reservationQuery.in("status", ["pending", "approved"])
-      : reservationQuery;
+      : isEquipmentManager
+        ? reservationQuery
+        : reservationQuery
+          .eq("requested_by", currentUser.id)
+          .in("status", ["pending", "approved"])
+          .gte("end_date", manilaDateKey());
 
     const [
       equipmentResult,
+      reportedQuantitiesResult,
       categoryResult,
       borrowingResult,
       borrowerResult,
@@ -701,10 +756,11 @@ export default function Home() {
     ] = await Promise.all([
       client.rpc("search_equipment_page", {
         p_search: search.trim() || null,
-        p_category_id: category === "All equipment" ? null : categoryOptions.find((option) => option.category_name === category)?.category_id || null,
+        p_category_id: category === "All equipment" ? null : categoryOptions.find((option) => option.category_name === category && !isHiddenEquipmentCategory(option.category_name))?.category_id || null,
         p_after_name: equipmentPageCursors[equipmentPageIndex]?.equipment_name || null,
         p_after_id: equipmentPageCursors[equipmentPageIndex]?.equipment_id || null,
       }),
+      client.rpc("equipment_reported_quantities"),
       client.from("categories").select("category_id, category_name").order("category_name"),
       scopedBorrowingQuery,
       isEquipmentManager ? Promise.resolve({ data: null, error: null }) : client.rpc("current_borrower_id"),
@@ -731,6 +787,11 @@ export default function Home() {
 
     const errors = [];
     let borrowerMissing = false;
+    if (reportedQuantitiesResult.error) {
+      errors.push(["Reported equipment quantities could not be loaded:", reportedQuantitiesResult.error]);
+    }
+    const reportedQuantitiesByEquipment = new Map((reportedQuantitiesResult.data || [])
+      .map((item) => [Number(item.equipment_id), Number(item.reported_quantity || 0)]));
     if (notificationsResult.error) {
       errors.push(["Notifications could not be loaded:", notificationsResult.error]);
       setNotifications([]);
@@ -806,6 +867,10 @@ export default function Home() {
         status: item.availability_status === "borrowed" ? "checked_out" : item.availability_status,
         image_url: item.image_url || null,
         quantity: item.quantity ?? 1,
+        effective_quantity: Math.max(
+          0,
+          Number(item.quantity ?? 1) - (reportedQuantitiesByEquipment.get(Number(item.equipment_id)) || 0),
+        ),
         available_quantity: item.available_quantity ?? null,
       })));
     }
@@ -859,7 +924,7 @@ export default function Home() {
             id: equipmentItem.equipment_id,
             name: equipmentNames.join(", "),
             asset_tag: assetCodes.join(", "),
-            category: equipmentItem.categories?.category_name || "General",
+            category: displayEquipmentCategory(equipmentItem.categories?.category_name),
           } : null,
           equipment_items: (item.borrowing_items || []).map((borrowingItem) => borrowingItem.equipment?.equipment_name).filter(Boolean),
           quantity: (item.borrowing_items || []).reduce((total, borrowingItem) => total + Number(borrowingItem.quantity || 1), 0),
@@ -896,7 +961,7 @@ export default function Home() {
         id: item.equipment.equipment_id,
         asset_tag: item.equipment.asset_code,
         name: item.equipment.equipment_name,
-        category: item.equipment.categories?.category_name || "General",
+        category: displayEquipmentCategory(item.equipment.categories?.category_name),
       } : null,
       quantity: item.quantity || 1,
     })));
@@ -1066,15 +1131,27 @@ export default function Home() {
     return () => window.removeEventListener("keydown", focusSearch);
   }, []);
 
-  const categories = useMemo(
-    () => ["All equipment", ...categoryOptions.map((item) => item.category_name)],
+  const selectableCategoryOptions = useMemo(
+    () => categoryOptions.filter((item) => !isHiddenEquipmentCategory(item.category_name)),
     [categoryOptions],
   );
+  const categories = useMemo(
+    () => ["All equipment", ...selectableCategoryOptions.map((item) => item.category_name)],
+    [selectableCategoryOptions],
+  );
+  useEffect(() => {
+    if (category !== "All equipment" && isHiddenEquipmentCategory(category)) {
+      setCategory("All equipment");
+      setEquipmentPageCursors([null]);
+      setEquipmentPageIndex(0);
+    }
+  }, [category]);
   const filteredEquipment = useMemo(() => {
     const query = search.trim().toLowerCase();
     return equipment.filter((item) => {
-      const matchesCategory = category === "All equipment" || item.category === category;
-      const matchesQuery = !query || [item.name, item.asset_tag, item.category, item.location, item.brand, item.model].some((field) => field?.toLowerCase().includes(query));
+      const visibleCategory = displayEquipmentCategory(item.category);
+      const matchesCategory = category === "All equipment" || visibleCategory === category;
+      const matchesQuery = !query || [item.name, item.asset_tag, visibleCategory, item.location, item.brand, item.model].some((field) => field?.toLowerCase().includes(query));
       return matchesCategory && matchesQuery;
     });
   }, [equipment, category, search]);
@@ -1119,31 +1196,6 @@ export default function Home() {
       const message = getErrorMessage(actionError);
       if (message === PENDING_BORROWER_MESSAGE) setNotice(message);
       else setError(message);
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function anonymizeMember(member) {
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      if (member.profile_photo_path) {
-        const { error: storageError } = await supabase.storage.from("profile-photos").remove([member.profile_photo_path]);
-        if (storageError) {
-          console.error("The profile photo could not be deleted:", storageError);
-          throw new Error("The profile photo could not be deleted; borrower details were not changed.");
-        }
-      }
-      const { error: anonymizeError } = await supabase.rpc("admin_anonymize_inactive_borrower", { p_user_id: member.id });
-      if (anonymizeError) throw anonymizeError;
-      await refresh();
-      setNotice("Borrower details anonymized.");
-      return true;
-    } catch (actionError) {
-      setError(getErrorMessage(actionError));
       return false;
     } finally {
       setBusy(false);
@@ -1234,10 +1286,24 @@ export default function Home() {
   }
 
   async function markAllNotificationsRead() {
-    await runAction(
-      () => supabase.rpc("mark_all_notifications_read"),
+    const completed = await runAction(async () => {
+      const { data, error: markError } = await supabase.rpc("mark_all_notifications_read");
+      if (markError) throw markError;
+      const { count, error: verifyError } = await supabase.from("notifications")
+        .select("notification_id", { count: "exact", head: true })
+        .eq("is_read", false);
+      if (verifyError) throw verifyError;
+      if (typeof count !== "number" || count > 0) {
+        throw new Error("Some notifications are still unread. Please try again.");
+      }
+      return { data };
+    },
       "All notifications marked as read.",
     );
+    if (completed) {
+      setNotifications((current) => current.map((item) => ({ ...item, is_read: true })));
+      setUnreadNotificationCount(0);
+    }
   }
 
   async function uploadEquipmentImage(form) {
@@ -1301,7 +1367,7 @@ export default function Home() {
     const item = {
       asset_code: String(form.get("asset_tag") || "").trim(),
       equipment_name: String(form.get("name") || "").trim(),
-      category_id: Number(form.get("category_id")),
+      category_id: Number(form.get("category_id") || modal.item.category_id),
       quantity: Number(form.get("quantity")),
       brand: String(form.get("brand") || "").trim() || null,
       model: String(form.get("model") || "").trim() || null,
@@ -1476,8 +1542,35 @@ export default function Home() {
     account: ["Your profile", "Account settings", "Keep your name and department information up to date."],
   }[view] || ["Workspace", "Equipment", "Manage equipment and requests."];
 
-  const myBorrowings = borrowings.filter((item) => Number(item.borrower_id) === Number(borrowerId));
-  const myReservations = reservations.filter((item) => item.requester_id === user.id);
+  const myBorrowings = borrowings
+    .filter((item) =>
+      Number(item.borrower_id) === Number(borrowerId) && ACTIVE_BORROWING.includes(item.status))
+    .map((item) => {
+      const borrowingItems = getBorrowerActivityItems(item.borrowing_items);
+      if (["released", "overdue", "return_requested"].includes(item.status) && !borrowingItems.length) {
+        return null;
+      }
+      const firstEquipmentItem = borrowingItems[0]?.equipment;
+      const equipmentNames = borrowingItems.map((borrowingItem) => borrowingItem.equipment?.equipment_name).filter(Boolean);
+      const assetCodes = borrowingItems.map((borrowingItem) => borrowingItem.equipment?.asset_code).filter(Boolean);
+      return {
+        ...item,
+        borrowing_items: borrowingItems,
+        equipment: firstEquipmentItem ? {
+          id: firstEquipmentItem.equipment_id,
+          name: equipmentNames.join(", "),
+          asset_tag: assetCodes.join(", "),
+          category: displayEquipmentCategory(firstEquipmentItem.categories?.category_name),
+        } : null,
+        equipment_items: equipmentNames,
+        quantity: borrowingItems.reduce((total, borrowingItem) => total + Number(borrowingItem.quantity || 1), 0),
+      };
+    })
+    .filter(Boolean);
+  const myReservations = reservations.filter((item) =>
+    item.requester_id === user.id
+      && ["pending", "approved"].includes(item.status)
+      && isManilaDateTimeCurrent(item.end_date, item.end_time));
   const visibleNavItems = isAdmin
     ? ADMIN_NAV_ITEMS
     : isPropertyCustodian
@@ -1634,7 +1727,7 @@ export default function Home() {
                   <div className="section-title"><div><h2>Find equipment</h2><p>Browse what’s available for your next project</p></div><button className="text-action" onClick={() => setView("equipment")}>Explore library <ArrowUpRight size={15} /></button></div>
                   <div className="equipment-grid compact-grid">
                     {(equipment.filter((item) => item.status === "available").slice(0, 3)).map((item) => <EquipmentCard key={item.id} item={item} canRequest={false} onBorrow={(selected) => setModal({ kind: "borrow", item: selected })} onReserve={(selected) => setModal({ kind: "reservation", item: selected })} />)}
-                    {!loading && equipment.length === 0 && <EmptyState title="Your equipment library is ready" copy="Once equipment is added to the inventory, it will appear here." action={isAdmin ? "Add equipment" : null} onAction={() => setModal({ kind: "add-equipment" })} />}
+                    {!loading && equipment.length === 0 && <EmptyState title="Your equipment library is ready" copy="Once equipment is added to the inventory, it will appear here." action={isEquipmentManager ? "Add equipment" : null} onAction={() => setModal({ kind: "add-equipment" })} />}
                   </div>
                 </>
               )}
@@ -1658,8 +1751,7 @@ export default function Home() {
               <nav className="unit-pagination" aria-label="Equipment pages"><span>Page {equipmentPageIndex + 1} · {equipment.length} of {equipmentTotalCount} items</span><div><button className="button-secondary" type="button" onClick={() => setEquipmentPageIndex((index) => Math.max(0, index - 1))} disabled={equipmentPageIndex === 0}><ArrowLeft size={14} /> Previous</button><button className="button-secondary" type="button" onClick={nextEquipmentPage} disabled={equipment.length < 20}>Next <ArrowRight size={14} /></button></div></nav>
               {isEquipmentManager && (
                 <>
-                  <div className="section-title"><div><h2>Manage equipment</h2><p>Edit item details or remove retired equipment from the active library.</p></div><span className="record-count">{equipmentTotalCount} active items</span></div>
-                  <div className="unit-management-link"><Link className="button-secondary" href="/equipment-units">Manage units, maintenance, and labels <ArrowUpRight size={15} /></Link></div>
+                  <div className="section-title"><div><h2>Manage equipment</h2><p>Add, edit, or remove equipment from the active library.</p></div><span className="record-count">{equipmentTotalCount} active items</span></div>
                   <EquipmentTable
                     equipment={equipment}
                     onEdit={(item) => setModal({ kind: "edit-equipment", item })}
@@ -1675,14 +1767,14 @@ export default function Home() {
           )}
 
           {view === "currently-borrowed" && isEquipmentManager && (
-            <CurrentlyBorrowedWorkspace rows={currentlyBorrowed} categories={categoryOptions} loading={loading} />
+            <CurrentlyBorrowedWorkspace rows={currentlyBorrowed} categories={selectableCategoryOptions} loading={loading} />
           )}
 
           {view === "loans" && !isEquipmentManager && !isPendingBorrower && (
             <>
               <div className="toolbar list-toolbar">
-                <div className="list-toolbar-copy"><span className="toolbar-icon"><ClipboardList size={17} /></span><div><strong>My equipment</strong><small>Borrowing requests and reservations tied to your account</small></div></div>
-                <span className="record-count">{myBorrowings.length + myReservations.length} records</span>
+                <div className="list-toolbar-copy"><span className="toolbar-icon"><ClipboardList size={17} /></span><div><strong>My equipment</strong><small>Current borrowing requests and reservations</small></div></div>
+                <span className="record-count">{myBorrowings.length + myReservations.length} active records</span>
               </div>
               <BorrowingList
                 rows={myBorrowings}
@@ -1691,10 +1783,20 @@ export default function Home() {
                 onPageChange={setBorrowingsPage}
                 onRequestReturn={(row) => runAction(() => supabase.rpc("request_equipment_return", { p_borrowing_id: row.id }), "Return request submitted.")}
                 onCancelRequest={(row) => runAction(() => supabase.rpc("cancel_my_pending_borrowing", { p_borrowing_id: row.id }), "Borrowing request cancelled.")}
+                onReportCondition={(borrowingItem, reportType, description, quantity) => runAction(
+                  () => supabase.rpc("report_borrowing_item_condition", {
+                    p_borrowing_item_id: borrowingItem.borrowing_item_id,
+                    p_report_type: reportType,
+                    p_description: description,
+                    p_quantity_affected: quantity,
+                  }),
+                  "Damage/loss report submitted.",
+                )}
+                busy={busy}
                 loading={loading}
               />
               {currentUnitTags.length > 0 && <section className="borrower-unit-tags"><div className="section-title"><div><h2>Unit tags currently assigned to you</h2><p>Only the asset tags of your held units are shown here.</p></div></div><ul>{currentUnitTags.map((unit, index) => <li key={`${unit.asset_tag}-${index}`}>{unit.asset_tag}</li>)}</ul></section>}
-              <div className="section-title"><div><h2>My reservations</h2><p>Upcoming and past reservation requests</p></div><span className="record-count">{myReservations.length} records</span></div>
+              <div className="section-title"><div><h2>My reservations</h2><p>Current and upcoming reservations</p></div><span className="record-count">{myReservations.length} active</span></div>
               <ReservationList
                 rows={myReservations}
                 loading={loading}
@@ -1717,7 +1819,6 @@ export default function Home() {
               supabase={supabase}
               canReview={isAdmin || isPropertyCustodian}
               userId={user.id}
-              refreshEquipment={refresh}
             />
           )}
 
@@ -1736,7 +1837,7 @@ export default function Home() {
                 <div className="list-toolbar-copy"><span className="toolbar-icon"><UsersRound size={17} /></span><div><strong>Workspace members</strong><small>Manage access to equipment operations</small></div></div>
                 <span className="record-count">{members.length} accounts</span>
               </div>
-              <MemberTable members={members} currentUserId={user.id} busy={busy} runAction={runAction} onAnonymize={anonymizeMember} supabase={supabase} />
+              <MemberTable members={members} currentUserId={user.id} runAction={runAction} supabase={supabase} />
               <section className="agreement-publisher">
                 <div className="section-title"><div><h2>Borrower agreement</h2><p>Publishing a new version requires borrowers to accept it before their next request.</p></div>
                   {activeAgreement && <span className="record-count">Current version {activeAgreement.version_number}</span>}
@@ -1758,7 +1859,6 @@ export default function Home() {
             <FeedbackBoard
               threads={feedbackThreads}
               currentUserId={user.id}
-              isAdmin={isAdmin}
               canManageFeedback={isEquipmentManager}
               busy={busy}
               onCreate={submitFeedback}
@@ -1806,7 +1906,7 @@ export default function Home() {
                 <p className="modal-copy">{modal.kind === "edit-equipment" ? "Update this record. Changes are saved to the database audit history." : "Create an equipment record for your team to discover and request."}</p>
                 <form className="modal-form" onSubmit={modal.kind === "edit-equipment" ? updateEquipment : addEquipment}>
                   <label><span>Equipment name</span><input name="name" placeholder="e.g. Canon EOS R6" defaultValue={modal.item?.name || ""} required maxLength={160} /></label>
-                  <div className="form-row"><label><span>Asset code</span><input name="asset_tag" placeholder="CAM-001" defaultValue={modal.item?.asset_tag || ""} required maxLength={80} /></label><label><span>Category</span><select name="category_id" defaultValue={modal.item?.category_id || ""} required><option value="" disabled>Select a category</option>{categoryOptions.map((option) => <option key={option.category_id} value={option.category_id}>{option.category_name}</option>)}</select></label></div>
+                  <div className="form-row"><label><span>Asset code</span><input name="asset_tag" placeholder="CAM-001" defaultValue={modal.item?.asset_tag || ""} required maxLength={80} /></label><label><span>Category</span><select name="category_id" defaultValue={modal.item?.category_id || ""} required><option value="" disabled>Select a category</option>{modal.item && isHiddenEquipmentCategory(modal.item.category) && <option value={modal.item.category_id} disabled>Existing assignment (hidden)</option>}{selectableCategoryOptions.map((option) => <option key={option.category_id} value={option.category_id}>{option.category_name}</option>)}</select></label></div>
                   <label><span>Amount</span><input name="quantity" type="number" min="0" max="10000" step="1" defaultValue={modal.item?.quantity ?? 1} readOnly={modal.item?.tracking_mode === "unit"} required />{modal.item?.tracking_mode === "unit" && <small className="field-hint">Unit count is maintained from the equipment units page.</small>}</label>
                   <div className="form-row"><label><span>Brand (optional)</span><input name="brand" defaultValue={modal.item?.brand || ""} maxLength={120} /></label><label><span>Model (optional)</span><input name="model" defaultValue={modal.item?.model || ""} maxLength={120} /></label></div>
                   <label><span>Serial number (optional)</span><input name="serial_number" defaultValue={modal.item?.serial_number || ""} maxLength={160} /></label>
@@ -1819,7 +1919,7 @@ export default function Home() {
                   {modal.kind === "edit-equipment" && modal.item.image_url && <label className="checkbox-label"><input name="remove_image" type="checkbox" /><span>Remove current picture</span></label>}
                   {modal.kind === "edit-equipment" && <label><span>Condition</span><select name="condition_status" defaultValue={modal.item.condition_status === "fair" ? "" : modal.item.condition_status} required><option value="" disabled>Choose condition</option><option value="good">Good</option><option value="damaged">Damaged</option></select>{modal.item.condition_status === "fair" && <small className="field-hint">Previously saved as Fair. Choose Good or Damaged.</small>}</label>}
                   {modal.kind === "edit-equipment" && <label><span>Availability</span><select name="status" defaultValue={modal.item.availability_status}><option value="available">Available</option><option value="maintenance">Maintenance</option><option value="retired">Retired</option>{["borrowed", "reserved"].includes(modal.item.availability_status) && <option value={modal.item.availability_status}>{modal.item.availability_status === "borrowed" ? "Borrowed" : "Reserved"} (manage through requests)</option>}</select></label>}
-                  <div className="modal-actions"><button type="button" className="button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button-primary" disabled={busy || (!categoryOptions.length && modal.kind === "add-equipment")} type="submit">{busy ? "Saving…" : modal.kind === "edit-equipment" ? "Save changes" : "Add to inventory"} {modal.kind === "edit-equipment" ? <Check size={15} /> : <Plus size={15} />}</button></div>
+                  <div className="modal-actions"><button type="button" className="button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button-primary" disabled={busy || (!selectableCategoryOptions.length && modal.kind === "add-equipment")} type="submit">{busy ? "Saving…" : modal.kind === "edit-equipment" ? "Save changes" : "Add to inventory"} {modal.kind === "edit-equipment" ? <Check size={15} /> : <Plus size={15} />}</button></div>
                 </form>
               </>
             ) : (
@@ -1908,9 +2008,9 @@ function PasswordRecoveryDialog({ supabase, onComplete }) {
   );
 }
 
-function BorrowingList({ rows, onRequestReturn, onCancelRequest, loading, page, hasMore, onPageChange }) {
+function BorrowingList({ rows, onRequestReturn, onCancelRequest, onReportCondition, busy, loading, page, hasMore, onPageChange }) {
   if (loading) return <LoadingPanel />;
-  if (!rows.length) return <EmptyState title="No borrowing activity yet" copy="When you request equipment, updates will appear here." />;
+  if (!rows.length) return <EmptyState title="No current borrowing items or requests" copy="Active borrowing requests will appear here." />;
   return (
     <div className="loan-list">
       {rows.map((item) => (
@@ -1927,9 +2027,53 @@ function BorrowingList({ rows, onRequestReturn, onCancelRequest, loading, page, 
             {["released", "overdue"].includes(item.status) && <button className="button-secondary" onClick={() => onRequestReturn(item)}>Request return</button>}
             {item.status === "return_requested" && <span className="return-note"><Clock3 size={14} /> Return requested</span>}
           </div>
+          {["released", "overdue", "return_requested"].includes(item.status) && (item.borrowing_items || [])
+            .filter((borrowingItem) => borrowingItem.item_status === "released")
+            .map((borrowingItem) => <BorrowingConditionReportForm
+              key={borrowingItem.borrowing_item_id}
+              borrowingItem={borrowingItem}
+              busy={busy}
+              onSubmit={onReportCondition}
+            />)}
         </article>
       ))}
-      <nav className="unit-pagination" aria-label="Borrowing history pages"><span>Page {page + 1}</span><div><button className="button-secondary" type="button" onClick={() => onPageChange(Math.max(0, page - 1))} disabled={page === 0}><ArrowLeft size={14} /> Previous</button><button className="button-secondary" type="button" onClick={() => onPageChange(page + 1)} disabled={!hasMore}>Next <ArrowRight size={14} /></button></div></nav>
+      <nav className="unit-pagination" aria-label="Current borrowing pages"><span>Page {page + 1}</span><div><button className="button-secondary" type="button" onClick={() => onPageChange(Math.max(0, page - 1))} disabled={page === 0}><ArrowLeft size={14} /> Previous</button><button className="button-secondary" type="button" onClick={() => onPageChange(page + 1)} disabled={!hasMore}>Next <ArrowRight size={14} /></button></div></nav>
+    </div>
+  );
+}
+
+function BorrowingConditionReportForm({ borrowingItem, busy, onSubmit }) {
+  const [open, setOpen] = useState(false);
+  const [reportType, setReportType] = useState("damage");
+  const [quantity, setQuantity] = useState("1");
+  const [description, setDescription] = useState("");
+
+  async function submit(event) {
+    event.preventDefault();
+    const saved = await onSubmit(borrowingItem, reportType, description.trim(), Number(quantity));
+    if (saved) {
+      setDescription("");
+      setQuantity("1");
+      setOpen(false);
+    }
+  }
+
+  const itemName = borrowingItem.equipment?.equipment_name || "Borrowed equipment";
+  const maxQuantity = Number(borrowingItem.quantity || 1);
+  return (
+    <div className="borrower-condition-report">
+      <button className="button-secondary" type="button" onClick={() => setOpen((current) => !current)} disabled={busy}>
+        {open ? "Cancel report" : `Report damage or loss · ${itemName}`}
+      </button>
+      {open && <form className="borrower-condition-report-form" onSubmit={submit}>
+        <label><span>Report type</span><select value={reportType} onChange={(event) => setReportType(event.target.value)} disabled={busy}>
+          <option value="damage">Damaged</option>
+          <option value="loss">Lost</option>
+        </select></label>
+        {maxQuantity > 1 && <label><span>Quantity affected</span><input type="number" min="1" max={maxQuantity} value={quantity} onChange={(event) => setQuantity(event.target.value)} required disabled={busy} /> <small>Up to {maxQuantity} borrowed items.</small></label>}
+        <label><span>Details</span><textarea value={description} onChange={(event) => setDescription(event.target.value)} rows="2" maxLength={2000} required disabled={busy} /></label>
+        <button className="button-primary" type="submit" disabled={busy || !description.trim()}>{busy ? "Submitting…" : "Submit report"}</button>
+      </form>}
     </div>
   );
 }
@@ -1982,7 +2126,7 @@ function BorrowingConditionDetails({ borrowingItems = [] }) {
 
 function ReservationList({ rows, loading, admin = false, onCancel }) {
   if (loading) return <LoadingPanel />;
-  if (!rows.length) return <EmptyState title="No reservations yet" copy="Reserve equipment for an upcoming project from the equipment library." />;
+  if (!rows.length) return <EmptyState title="No current reservations" copy="Active or upcoming reservations will appear here." />;
   return (
     <div className="reservation-list">
       {rows.map((item) => (
@@ -1998,34 +2142,7 @@ function ReservationList({ rows, loading, admin = false, onCancel }) {
   );
 }
 
-function BorrowingTable({ rows, loading, page, hasMore, onPageChange }) {
-  if (loading) return <LoadingPanel />;
-  if (!rows.length) return <EmptyState title="No returned borrowing history" copy="Completed borrowing requests will appear here after equipment is returned." />;
-  return (
-    <>
-      <div className="table-wrap">
-        <table>
-          <thead><tr><th>Equipment</th><th>Borrower</th><th>Dates</th><th>Status</th></tr></thead>
-          <tbody>{rows.map((item) => <tr key={item.id}>
-            <td><strong>{item.equipment?.name || "Equipment"}</strong><small>{item.equipment?.asset_tag}</small><BorrowingConditionDetails borrowingItems={item.borrowing_items} /></td>
-            <td><strong>{item.borrower_name || "Member"}</strong><small>{item.borrower_email}</small></td>
-            <td><strong>{dateLabel(item.start_date)} – {dateTimeLabel(item.expected_return)}</strong><BorrowingReturnTimes borrowingItems={item.borrowing_items} /><small>{item.location_of_use || item.purpose}</small></td>
-            <td><StatusPill value={item.status} /></td>
-          </tr>)}</tbody>
-        </table>
-      </div>
-      <nav className="unit-pagination" aria-label="Returned borrowing history pages">
-        <span>Page {page + 1}</span>
-        <div>
-          <button className="button-secondary" type="button" onClick={() => onPageChange(Math.max(0, page - 1))} disabled={page === 0}><ArrowLeft size={14} /> Previous</button>
-          <button className="button-secondary" type="button" onClick={() => onPageChange(page + 1)} disabled={!hasMore}>Next <ArrowRight size={14} /></button>
-        </div>
-      </nav>
-    </>
-  );
-}
-
-function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSearchChange, page, hasMore, onPageChange, busy, runAction, supabase, canReview, userId, refreshEquipment }) {
+function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSearchChange, page, hasMore, onPageChange, busy, runAction, supabase, canReview, userId }) {
   const [pickupGraceMinutes, setPickupGraceMinutes] = useState("");
   const [settingsError, setSettingsError] = useState("");
   const [workflowError, setWorkflowError] = useState("");
@@ -2034,13 +2151,6 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
   const [overdueSearch, setOverdueSearch] = useState("");
   const [overdueReturnItem, setOverdueReturnItem] = useState(null);
   const [overdueReturnLoadingId, setOverdueReturnLoadingId] = useState(null);
-  const [damageReports, setDamageReports] = useState([]);
-  const [savingDamageReportId, setSavingDamageReportId] = useState(null);
-  const [damageReportError, setDamageReportError] = useState("");
-  const [returnedHistory, setReturnedHistory] = useState([]);
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [historyPage, setHistoryPage] = useState(0);
-  const [historyHasMore, setHistoryHasMore] = useState(false);
   const [workflowRefreshKey, setWorkflowRefreshKey] = useState(0);
   const query = borrowerSearch.trim().toLocaleLowerCase();
   const matchesBorrower = (name, email) => !query
@@ -2050,19 +2160,12 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
     if (!canReview) return undefined;
     let active = true;
     async function loadOperationalData() {
-      setHistoryLoading(true);
-      const [settingsResult, overdueResult, reportResult, historyResult] = await Promise.all([
+      const [settingsResult, overdueResult] = await Promise.all([
         supabase.from("reservation_settings")
           .select("pickup_grace_period_minutes")
           .eq("singleton", true)
           .single(),
         supabase.rpc("list_overdue_borrowings_page", { p_page: overduePage, p_search: overdueSearch.trim() || null }),
-        supabase.rpc("list_damage_loss_reports"),
-        supabase.from("borrowings")
-          .select("borrowing_id, request_date, expected_return_date, destination, purpose, transaction_status, created_at, borrowers(first_name, middle_name, last_name, email), borrowing_items(borrowing_item_id, quantity, returned_at, condition_at_release, condition_at_return, equipment(equipment_name, asset_code))")
-          .eq("transaction_status", "returned")
-          .order("created_at", { ascending: false })
-          .range(historyPage * 20, historyPage * 20 + 19),
       ]);
       if (!active) return;
       if (settingsResult.error) {
@@ -2079,55 +2182,36 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
         hasLoadError = true;
         setOverdueItems([]);
       } else {
-        setOverdueItems(overdueResult.data || []);
+        const overdueRows = overdueResult.data || [];
+        const overdueBorrowingIds = [...new Set(overdueRows.map((item) => item.borrowing_id))];
+        const returnRequestsResult = overdueBorrowingIds.length
+          ? await supabase.from("return_requests")
+            .select("borrowing_id")
+            .eq("status", "pending")
+            .in("borrowing_id", overdueBorrowingIds)
+          : { data: [], error: null };
+        if (returnRequestsResult.error) {
+          console.error("Overdue return requests could not be loaded:", returnRequestsResult.error);
+          hasLoadError = true;
+          setOverdueItems([]);
+        } else {
+          const pendingReturnIds = new Set((returnRequestsResult.data || []).map((item) => item.borrowing_id));
+          setOverdueItems(overdueRows.map((item) => ({
+            ...item,
+            return_requested: pendingReturnIds.has(item.borrowing_id),
+          })));
+        }
       }
-      if (reportResult.error) {
-        console.error("Damage and loss reports could not be loaded:", reportResult.error);
-        hasLoadError = true;
-        setDamageReports([]);
-      } else {
-        setDamageReports((reportResult.data || []).filter((report) => report.resolution_status !== "resolved"));
-      }
-      if (historyResult.error) {
-        console.error("Returned borrowing history could not be loaded:", historyResult.error);
-        hasLoadError = true;
-        setReturnedHistory([]);
-        setHistoryHasMore(false);
-      } else {
-        const historyRows = historyResult.data || [];
-        setHistoryHasMore(historyRows.length === 20);
-        setReturnedHistory(historyRows.map((item) => {
-          const borrower = item.borrowers || {};
-          const borrowingItems = item.borrowing_items || [];
-          return {
-            id: item.borrowing_id,
-            start_date: item.request_date,
-            expected_return: item.expected_return_date,
-            location_of_use: item.destination,
-            purpose: item.purpose,
-            status: item.transaction_status,
-            borrower_name: [borrower.first_name, borrower.middle_name, borrower.last_name].filter(Boolean).join(" "),
-            borrower_email: borrower.email || "",
-            equipment: {
-              name: borrowingItems.map((detail) => detail.equipment?.equipment_name).filter(Boolean).join(", ") || "Equipment",
-              asset_tag: borrowingItems.map((detail) => detail.equipment?.asset_code).filter(Boolean).join(", "),
-            },
-            borrowing_items: borrowingItems,
-          };
-        }));
-      }
-      setHistoryLoading(false);
       setWorkflowError(hasLoadError ? "Some request information is unavailable right now." : "");
     }
     loadOperationalData().catch((loadError) => {
       console.error("Request operations could not be loaded:", loadError);
       if (active) {
-        setHistoryLoading(false);
         setWorkflowError("Request information is unavailable right now.");
       }
     });
     return () => { active = false; };
-  }, [canReview, supabase, workflowRefreshKey, overduePage, overdueSearch, historyPage]);
+  }, [canReview, supabase, workflowRefreshKey, overduePage, overdueSearch]);
 
   async function savePickupGracePeriod(event) {
     event.preventDefault();
@@ -2202,6 +2286,15 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
     setOverdueReturnItem(null);
     setOverdueReturnLoadingId(overdueItem.borrowing_id);
     try {
+      const { data: returnRequest, error: returnRequestError } = await supabase.from("return_requests")
+        .select("return_request_id")
+        .eq("borrowing_id", overdueItem.borrowing_id)
+        .eq("status", "pending")
+        .maybeSingle();
+      if (returnRequestError) throw returnRequestError;
+      if (!returnRequest) {
+        throw new Error("The borrower must request a return before equipment can be recorded as returned.");
+      }
       const { data, error } = await supabase.from("borrowings")
         .select("borrowing_id, transaction_status, borrowing_items(borrowing_item_id, equipment_id, item_status, quantity, is_overdue, equipment(equipment_id, tracking_mode))")
         .eq("borrowing_id", overdueItem.borrowing_id)
@@ -2241,34 +2334,6 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
     }
   }
 
-  async function resolveReport(reportId, status, notes, isRecovered) {
-    setSavingDamageReportId(reportId);
-    setDamageReportError("");
-    try {
-      const result = await supabase.rpc("resolve_damage_loss_report", {
-        p_report_id: reportId,
-        p_resolution_status: status,
-        p_resolution_notes: notes,
-        p_is_recovered: isRecovered,
-      });
-      if (result.error) throw result.error;
-      setDamageReports((current) => status === "resolved"
-        ? current.filter((report) => report.report_id !== reportId)
-        : current.map((report) => report.report_id === reportId
-          ? { ...report, resolution_status: status, resolution_notes: notes || null, is_recovered: isRecovered }
-          : report));
-      setWorkflowRefreshKey((key) => key + 1);
-      await refreshEquipment();
-      return result.data || "Resolution saved.";
-    } catch (saveError) {
-      console.error("The damage or loss report resolution could not be saved:", saveError);
-      setDamageReportError(getErrorMessage(saveError));
-      return false;
-    } finally {
-      setSavingDamageReportId(null);
-    }
-  }
-
   const pendingBorrowings = borrowings.filter((item) =>
     item.status === "requested"
       && matchesBorrower(item.borrower_name, item.borrower_email));
@@ -2276,7 +2341,7 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
     item.status === "approved"
       && matchesBorrower(item.borrower_name, item.borrower_email));
   const releasedBorrowings = borrowings.filter((item) =>
-    ["released", "overdue", "return_requested"].includes(item.status)
+    item.status === "return_requested"
       && matchesBorrower(item.borrower_name, item.borrower_email));
   const pendingReservations = reservations.filter((item) =>
     item.status === "pending"
@@ -2356,8 +2421,8 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
           ))}
         </div>
       )}
-      <div className="section-title"><div><h2>Released — awaiting return</h2><p>Record the received condition; damage or loss reports are created when applicable.</p></div><span className="record-count">{releasedBorrowings.length} released</span></div>
-      {!releasedBorrowings.length ?       <EmptyState title="No released equipment awaiting return" copy={query ? "Try another first or last name." : "Released equipment will appear here until an administrator or custodian records its return."} /> : (
+      <div className="section-title"><div><h2>Return requested — awaiting receipt</h2><p>Record the received condition only after the borrower requests a return.</p></div><span className="record-count">{releasedBorrowings.length} requested</span></div>
+      {!releasedBorrowings.length ?       <EmptyState title="No borrower return requests waiting for receipt" copy={query ? "Try another first or last name." : "Released equipment appears here after its borrower submits a return request."} /> : (
         <div className="admin-request-list">
           {releasedBorrowings.map((item) => (
             <article className="admin-request" key={item.id}>
@@ -2388,7 +2453,7 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
                 <td><a href={`mailto:${encodeURIComponent(item.borrower_email)}`}>{item.borrower_email}</a>{item.borrower_phone && <small>{item.borrower_phone}</small>}</td>
                 <td>{dateTimeLabel(item.expected_return_at)}</td>
                 <td>{item.quantity}</td>
-                <td><button className="button-secondary" type="button" onClick={() => openOverdueReturn(item)} disabled={busy || overdueReturnLoadingId !== null}>{overdueReturnLoadingId === item.borrowing_id ? "Loading..." : "Record return"}</button></td>
+                <td><button className="button-secondary" type="button" onClick={() => openOverdueReturn(item)} disabled={busy || overdueReturnLoadingId !== null || !item.return_requested} title={!item.return_requested ? "The borrower must request a return first." : undefined}>{overdueReturnLoadingId === item.borrowing_id ? "Loading..." : item.return_requested ? "Record return" : "Waiting for request"}</button></td>
               </tr>)}</tbody>
             </table>
           </div>
@@ -2396,7 +2461,7 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
         {overdueReturnItem && <article className="admin-request overdue-return-action">
           <div className="admin-request-main">
             <h2>Record overdue return</h2>
-            <p>Confirm the received condition. Damaged or lost returns create a damage/loss report automatically.</p>
+            <p>Confirm the received condition and record any return notes.</p>
           </div>
           <WorkflowConditionAction
             stage="return"
@@ -2420,19 +2485,6 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
           <button className="button-secondary" type="button" onClick={() => setOverdueReturnItem(null)} disabled={busy}>Cancel</button>
         </article>}
         <nav className="unit-pagination" aria-label="Overdue item pages"><span>Page {overduePage + 1} · {overdueItems.length} items</span><div><button className="button-secondary" type="button" onClick={() => setOverduePage((page) => Math.max(0, page - 1))} disabled={overduePage === 0}><ArrowLeft size={14} /> Previous</button><button className="button-secondary" type="button" onClick={() => setOverduePage((page) => page + 1)} disabled={overdueItems.length < 20}>Next <ArrowRight size={14} /></button></div></nav>
-        <div className="section-title"><div><h2>Damage and loss reports</h2><p>Track follow-up and resolution for reported damage or lost items.</p></div><span className="record-count">{damageReports.length} reports</span></div>
-        {damageReportError && <p className="feedback feedback-error" role="alert">{damageReportError}</p>}
-        {!damageReports.length ? <EmptyState title="No damage or loss reports" copy="Reports will be created when an administrator or custodian records damaged or lost equipment." /> : (
-          <div className="admin-request-list">
-            {damageReports.map((report) => <DamageLossReportControl
-              key={report.report_id}
-              report={report}
-              busy={busy || savingDamageReportId !== null}
-              saving={savingDamageReportId === report.report_id}
-              onSave={(status, notes, isRecovered) => resolveReport(report.report_id, status, notes, isRecovered)}
-            />)}
-          </div>
-        )}
       </>}
       <div className="section-title"><div><h2>Reservation requests</h2><p>Check availability before confirming upcoming dates.</p></div><span className="record-count">{pendingReservations.length} to review</span></div>
       {!pendingReservations.length ? <EmptyState title={query ? "No matching reservation requests" : "No reservations to review"} copy={query ? "Try another first or last name." : "New reservation requests will appear here."} /> : (
@@ -2476,10 +2528,6 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
           ))}
         </div>
       )}
-      {canReview && <>
-        <div className="section-title"><div><h2>Borrowing history</h2><p>Compare the expected return with the actual return time and recorded item conditions.</p></div></div>
-        <BorrowingTable rows={returnedHistory} loading={historyLoading} page={historyPage} hasMore={historyHasMore} onPageChange={setHistoryPage} />
-      </>}
     </>
   );
 }
@@ -2748,66 +2796,15 @@ function UnitTagField({ label, value, disabled, onChange, onLookup }) {
   );
 }
 
-function DamageLossReportControl({ report, busy, saving: parentSaving, onSave }) {
-  const [status, setStatus] = useState(report.resolution_status);
-  const [notes, setNotes] = useState(report.resolution_notes || "");
-  const [isRecovered, setIsRecovered] = useState(Boolean(report.is_recovered));
-  const [saving, setSaving] = useState(false);
-  const [saveFeedback, setSaveFeedback] = useState(null);
-
-  async function submit(event) {
-    event.preventDefault();
-    setSaving(true);
-    setSaveFeedback(null);
-    try {
-      const saved = await onSave(status, notes.trim(), isRecovered);
-      setSaveFeedback(saved
-        ? { type: "success", message: typeof saved === "string" ? saved : "Resolution saved." }
-        : { type: "error", message: "Could not save. Check the page error and try again." });
-    } catch (saveError) {
-      console.error("The damage or loss resolution could not be saved:", saveError);
-      setSaveFeedback({ type: "error", message: "Could not save. Check the page error and try again." });
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <article className="admin-request damage-report-row">
-      <div className="admin-request-main">
-        <div className="loan-card-heading"><span className="card-category">{report.asset_code} · {report.report_type}</span><StatusPill value={report.resolution_status} /></div>
-        <h2>{report.equipment_name}</h2>
-        <p>{report.borrower_name} · {report.borrower_email}</p>
-        <small>{report.description} · {report.quantity_affected || 1} affected {Number(report.quantity_affected || 1) === 1 ? "unit" : "units"} · Reported {dateTimeLabel(report.created_at)}</small>
-      </div>
-      <form className="damage-report-resolution" onSubmit={submit}>
-        <label><span>Resolution</span><select value={status} onChange={(event) => { const nextStatus = event.target.value; setStatus(nextStatus); if (nextStatus !== "resolved") setIsRecovered(false); setSaveFeedback(null); }} disabled={busy || saving}>
-          <option value="open">Open</option>
-          <option value="under_review">Under review</option>
-          <option value="resolved">Resolved</option>
-          <option value="waived">Waived</option>
-        </select></label>
-        {report.report_type === "loss" && <label className="checkbox-label">
-          <input type="checkbox" checked={isRecovered} onChange={(event) => { setIsRecovered(event.target.checked); setSaveFeedback(null); }} disabled={busy || saving || status !== "resolved"} />
-          <span>Item physically recovered (required to restore availability)</span>
-        </label>}
-        <label><span>Resolution notes</span><textarea value={notes} onChange={(event) => { setNotes(event.target.value); setSaveFeedback(null); }} maxLength={2000} rows="2" disabled={busy || saving} required={["resolved", "waived"].includes(status)} /></label>
-        <button className="button-secondary" type="submit" disabled={busy || saving || (["resolved", "waived"].includes(status) && !notes.trim())}>{busy || saving || parentSaving ? "Saving…" : "Save resolution"}</button>
-        {saveFeedback && <p className={`feedback feedback-${saveFeedback.type}`} role={saveFeedback.type === "error" ? "alert" : "status"}>{saveFeedback.message}</p>}
-      </form>
-    </article>
-  );
-}
-
 function EquipmentTable({ equipment, onEdit, onDelete }) {
   if (!equipment.length) return <EmptyState title="No equipment records" copy="Add the first item to start your inventory." />;
   return (
     <div className="table-wrap inventory-table">
       <table><thead><tr><th>Asset</th><th>Category</th><th>Available / total</th><th>Storage</th><th>Status</th><th>Actions</th></tr></thead>
         <tbody>{equipment.map((item) => <tr key={item.id}>
-          <td><div className="inventory-asset">{item.image_url && <img src={item.image_url} alt="" />}<div><strong>{item.name}</strong><small>{item.asset_tag}</small></div></div></td><td>{item.category || "—"}</td><td>{item.available_quantity ?? "—"} / {item.quantity}</td><td>{item.location || "—"}</td><td><StatusPill value={item.quantity === 0 || item.available_quantity === 0 ? "out_of_stock" : item.status} /></td>
+          <td><div className="inventory-asset">{item.image_url && <img src={item.image_url} alt="" />}<div><strong>{item.name}</strong><small>{item.asset_tag}</small></div></div></td><td>{displayEquipmentCategory(item.category) || "—"}</td><td>{item.available_quantity ?? "—"} / {item.quantity}</td><td>{item.location || "—"}</td><td><StatusPill value={item.quantity === 0 || item.available_quantity === 0 ? "out_of_stock" : item.status} /></td>
           <td><div className="table-actions">
-            <button type="button" className="button-secondary" onClick={() => onEdit(item)} aria-label={`Edit ${item.name}`}><Pencil size={14} /> Edit</button>
+            {onEdit && <button type="button" className="button-secondary" onClick={() => onEdit(item)} aria-label={`Edit ${item.name}`}><Pencil size={14} /> Edit</button>}
             <button type="button" className="button-danger" onClick={() => onDelete(item)} aria-label={`Remove ${item.name}`}><Trash2 size={14} /> Delete</button>
           </div></td>
         </tr>)}</tbody>
@@ -2884,8 +2881,9 @@ function CurrentlyBorrowedWorkspace({ rows, categories, loading }) {
   if (loading) return <LoadingPanel />;
   const normalizedQuery = query.trim().toLowerCase();
   const matchesFilters = (item) => {
+    const categoryName = displayEquipmentCategory(item.category_name);
     const matchesStatus = status === "all" || item.record_status === status;
-    const matchesCategory = selectedCategory === "All equipment" || item.category_name === selectedCategory;
+    const matchesCategory = selectedCategory === "All equipment" || categoryName === selectedCategory;
     const matchesSearch = !normalizedQuery || [
       item.equipment_name,
       item.asset_code,
@@ -2925,7 +2923,7 @@ function CurrentlyBorrowedWorkspace({ rows, categories, loading }) {
           <thead><tr><th>Equipment</th><th>Borrower</th><th>Status</th><th>Location of use</th><th>Pickup time</th><th>Return time</th><th>Amount</th></tr></thead>
           <tbody>{visibleRows.map((item) => (
             <tr key={item.record_id}>
-              <td><div className="tracking-item"><span className="tracking-item-image">{item.equipment_image_url ? <img src={item.equipment_image_url} alt="" /> : <Package size={18} />}</span><span><strong>{item.equipment_name}</strong><small>{item.asset_code} · {item.category_name}</small></span></div></td>
+              <td><div className="tracking-item"><span className="tracking-item-image">{item.equipment_image_url ? <img src={item.equipment_image_url} alt="" /> : <Package size={18} />}</span><span><strong>{item.equipment_name}</strong><small>{[item.asset_code, displayEquipmentCategory(item.category_name)].filter(Boolean).join(" · ")}</small></span></div></td>
               <td>{item.borrower_name ? <div className="tracking-borrower"><ProfileAvatar name={item.borrower_name} photoUrl={item.profile_photo_url} className="borrower-photo" /><span><strong>{item.borrower_name}</strong><small>{item.department || "Department not provided"}</small></span></div> : "—"}</td>
               <td><StatusPill value={item.record_status} /></td>
               <td>{item.destination || item.storage_location || "—"}</td>
@@ -2940,7 +2938,8 @@ function CurrentlyBorrowedWorkspace({ rows, categories, loading }) {
   );
 }
 
-function FeedbackBoard({ threads, currentUserId, isAdmin, canManageFeedback, busy, onCreate, onReply, onDeleteReply, onDeleteThread, onStatusChange }) {
+function FeedbackBoard({ threads, currentUserId, canManageFeedback, busy, onCreate, onReply, onDeleteReply, onDeleteThread, onStatusChange }) {
+  const [categoryFilter, setCategoryFilter] = useState("all");
   const categoryLabels = {
     issue: "Issue",
     suggestion: "Suggestion",
@@ -2953,6 +2952,9 @@ function FeedbackBoard({ threads, currentUserId, isAdmin, canManageFeedback, bus
     planned: "Planned",
     implemented: "Implemented",
   };
+  const visibleThreads = categoryFilter === "all"
+    ? threads
+    : threads.filter((thread) => thread.category === categoryFilter);
   return (
     <div className="feedback-board">
       <section className="feedback-compose">
@@ -2967,16 +2969,29 @@ function FeedbackBoard({ threads, currentUserId, isAdmin, canManageFeedback, bus
         </form>
       </section>
 
-      <div className="section-title"><div><h2>Community feedback</h2><p>Ideas and updates shared across the equipment community</p></div><span className="record-count">{threads.length} topics</span></div>
-      {!threads.length ? <EmptyState title="Start the first conversation" copy="Your feedback will help members and admins decide what to improve next." /> : (
+      <div className="section-title">
+        <div><h2>Community feedback</h2><p>Ideas and updates shared across the equipment community</p></div>
+        <label><span>Show</span><select className="feedback-category-filter" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}>
+          <option value="all">All categories</option>
+          <option value="issue">Issues</option>
+          <option value="suggestion">Suggestions</option>
+          <option value="question">Questions</option>
+          <option value="other">Other</option>
+        </select></label>
+        <span className="record-count">{visibleThreads.length} of {threads.length} topics</span>
+      </div>
+      {!visibleThreads.length ? categoryFilter === "all"
+        ? <EmptyState title="Start the first conversation" copy="Your feedback will help members and admins decide what to improve next." />
+        : <EmptyState title="No feedback in this category" copy="Choose another category or start a new feedback thread." />
+        : (
         <div className="feedback-thread-list">
-          {threads.map((thread) => (
+          {visibleThreads.map((thread) => (
             <article className="feedback-thread" key={thread.id}>
               <header className="feedback-thread-header">
                 <div><span className={`feedback-category category-${thread.category}`}>{categoryLabels[thread.category] || thread.category.replaceAll("_", " ")}</span><span className={`feedback-status status-${thread.status}`}>{statusLabels[thread.status]}</span></div>
                 <div className="feedback-thread-controls">
                   {canManageFeedback && <label className="feedback-status-control"><span className="sr-only">Update discussion status</span><select value={thread.status} disabled={busy} onChange={(event) => onStatusChange(thread.id, event.target.value)}>{Object.entries(statusLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>}
-                  {isAdmin && <button className="feedback-delete-button" type="button" aria-label={`Delete feedback thread ${thread.title}`} title="Delete thread and replies" disabled={busy} onClick={() => onDeleteThread(thread)}><Trash2 size={14} /></button>}
+                  {canManageFeedback && <button className="feedback-delete-button" type="button" aria-label={`Delete feedback thread ${thread.title}`} title="Delete thread and replies" disabled={busy} onClick={() => onDeleteThread(thread)}><Trash2 size={14} /></button>}
                 </div>
               </header>
               <h3>{thread.title}</h3>
@@ -2984,7 +2999,7 @@ function FeedbackBoard({ threads, currentUserId, isAdmin, canManageFeedback, bus
               <div className="feedback-byline">Started by {thread.author_name} · {new Date(thread.created_at).toLocaleString()}</div>
               {!!thread.replies.length && <div className="feedback-replies">{thread.replies.map((reply) => (
                 <div className="feedback-reply" key={reply.id}>
-                  <div><strong>{reply.author_name}{reply.author_id === currentUserId ? " (you)" : ""}</strong><time>{new Date(reply.created_at).toLocaleString()}</time>{isAdmin && <button className="feedback-delete-button" type="button" aria-label={`Delete comment by ${reply.author_name}`} title="Delete comment" disabled={busy} onClick={() => onDeleteReply(reply)}><Trash2 size={14} /></button>}</div>
+                  <div><strong>{reply.author_name}{reply.author_id === currentUserId ? " (you)" : ""}</strong><time>{new Date(reply.created_at).toLocaleString()}</time>{canManageFeedback && <button className="feedback-delete-button" type="button" aria-label={`Delete comment by ${reply.author_name}`} title="Delete comment" disabled={busy} onClick={() => onDeleteReply(reply)}><Trash2 size={14} /></button>}</div>
                   <p>{reply.message}</p>
                 </div>
               ))}</div>}
@@ -3000,16 +3015,14 @@ function FeedbackBoard({ threads, currentUserId, isAdmin, canManageFeedback, bus
   );
 }
 
-function MemberTable({ members, currentUserId, busy, runAction, onAnonymize, supabase }) {
+function MemberTable({ members, currentUserId, runAction, supabase }) {
   if (!members.length) return <EmptyState title="No member accounts yet" copy="Accounts will appear here after users sign up and confirm their email." />;
-  const activeAdminCount = members.filter((member) => member.role === "admin" && member.account_status === "active").length;
   return (
     <div className="table-wrap inventory-table">
-      <table><thead><tr><th>Member</th><th>Account status</th><th>Role</th><th>Account created</th><th>Account actions</th></tr></thead>
+      <table><thead><tr><th>Member</th><th>Role</th><th>Account created</th></tr></thead>
         <tbody>{members.map((member) => (
           <tr key={member.id}>
             <td><strong>{member.display_name || "Unnamed member"}</strong><small>{member.email || "Email not available"}</small></td>
-            <td>{member.account_status || "—"}</td>
             <td>
               <select
                 aria-label={`Change role for ${member.display_name || member.email}`}
@@ -3027,37 +3040,6 @@ function MemberTable({ members, currentUserId, busy, runAction, onAnonymize, sup
               </select>
             </td>
             <td>{dateLabel(member.created_at?.slice(0, 10))}</td>
-            <td><div className="table-actions">
-              {member.account_status === "active" && member.id !== currentUserId && <button className="button-danger" type="button" disabled={busy || (member.role === "admin" && activeAdminCount <= 1)} title={member.role === "admin" && activeAdminCount <= 1 ? "The last active administrator cannot be deactivated." : undefined} onClick={() => {
-                if (window.confirm(`Deactivate ${member.display_name || member.email}? Their current sessions will be revoked.`)) {
-                  runAction(() => supabase.rpc("admin_deactivate_borrower_account", { p_user_id: member.id }), "Account deactivated.");
-                }
-              }}>Deactivate</button>}
-              {member.account_status === "inactive" && member.role === "staff" && member.email && <button className="button-danger" type="button" disabled={busy} onClick={() => {
-                if (window.prompt(`This permanently anonymizes ${member.display_name || member.email}. Type ANONYMIZE to continue.`) === "ANONYMIZE") onAnonymize(member);
-              }}>Anonymize borrower</button>}
-              {member.account_status === "inactive" && <button className="button-danger" type="button" disabled={busy} onClick={() => {
-                const accountLabel = member.display_name || member.email || "this account";
-                const confirmation = window.prompt(
-                  `Permanently delete ${accountLabel}? Their login and profile will be removed. Borrowing and audit history will be retained in anonymized form; feedback, reservations, notifications, and consent records may be removed. Type DELETE to continue.`,
-                );
-                if (confirmation === "DELETE") {
-                  runAction(async () => {
-                    const response = await fetch("/api/admin/permanently-delete-account", {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ userId: member.id }),
-                    });
-                    const result = await response.json();
-                    if (!response.ok) throw new Error(result.error || "Permanent account deletion failed.");
-                    return {
-                      notice: result.warning
-                        || "Account permanently deleted. Borrowing and audit history were retained.",
-                    };
-                  }, "Account permanently deleted.");
-                }
-              }}>Permanently delete</button>}
-            </div></td>
           </tr>
         ))}</tbody>
       </table>

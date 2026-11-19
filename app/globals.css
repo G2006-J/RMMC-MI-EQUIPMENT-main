@@ -221,7 +221,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .metric-card > small { color: #939c96; font-size: 9px; }
 .overview-report-grid { margin-top: 17px; display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 14px; }
 .overview-borrower-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.overview-report-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.overview-report-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .overview-report-card { width: 100%; min-width: 0; color: inherit; font: inherit; text-align: left; cursor: pointer; }
 .overview-report-card:hover, .overview-report-card:focus-visible { border-color: #cbd9ce; box-shadow: 0 8px 22px rgba(32,55,41,.08); }
 .overview-report-card > strong { min-width: 0; overflow-wrap: anywhere; font-size: clamp(16px, 1.6vw, 23px); }
@@ -299,6 +299,14 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .loan-date small { width: fit-content; max-width: 140px; overflow: hidden; padding: 3px 6px; border-radius: 12px; color: #657c50; background: #edf3e5; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .loan-date small.due-soon { color: #985c29; background: #fff0dd; }
 .loan-actions, .admin-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.borrower-condition-report { grid-column: 1 / -1; display: grid; justify-items: start; gap: 9px; }
+.borrower-condition-report > .button-secondary { max-width: 100%; white-space: normal; text-align: left; }
+.borrower-condition-report-form { width: min(100%, 560px); padding: 12px; display: grid; gap: 10px; border: 1px solid #e3e7e1; border-radius: 9px; background: #fafbf8; }
+.borrower-condition-report-form label > span { display: block; margin-bottom: 5px; color: #455249; font-size: 9px; font-weight: 700; }
+.borrower-condition-report-form select, .borrower-condition-report-form input, .borrower-condition-report-form textarea { width: 100%; min-height: 36px; padding: 8px 10px; border: 1px solid #e0e5df; border-radius: 8px; outline: 0; color: #27382e; background: white; font: inherit; font-size: 10px; }
+.borrower-condition-report-form textarea { resize: vertical; }
+.borrower-condition-report-form select:focus, .borrower-condition-report-form input:focus, .borrower-condition-report-form textarea:focus { border-color: #7fa64a; box-shadow: 0 0 0 3px #eaf1df; }
+.borrower-condition-report-form label small { display: block; margin-top: 4px; color: #929b95; font-size: 9px; }
 .button-secondary { min-height: 35px; padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid #dfe4de; border-radius: 8px; color: #425148; background: white; font-size: 9px; font-weight: 700; white-space: nowrap; }
 .button-secondary:hover:not(:disabled) { border-color: #bdd2ad; background: #f8faf5; }
 .return-note { display: inline-flex; align-items: center; gap: 5px; color: #93642d; font-size: 9px; }
@@ -395,9 +403,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .account-form-actions strong { color: #435549; text-transform: capitalize; }
 .feedback-form { margin-top: 18px; display: grid; gap: 12px; }
 .feedback-form label > span, .feedback-reply-form label > span { display: block; margin-bottom: 6px; color: #455249; font-size: 10px; font-weight: 700; }
-.feedback-form input, .feedback-form select, .feedback-form textarea, .feedback-reply-form textarea { width: 100%; min-height: 40px; padding: 10px 11px; border: 1px solid #e0e5df; border-radius: 8px; outline: 0; color: #27382e; background: white; font-size: 10px; }
+.feedback-form input, .feedback-form select, .feedback-form textarea, .feedback-category-filter, .feedback-reply-form textarea { width: 100%; min-height: 40px; padding: 10px 11px; border: 1px solid #e0e5df; border-radius: 8px; outline: 0; color: #27382e; background: white; font-size: 10px; }
 .feedback-form textarea, .feedback-reply-form textarea { resize: vertical; }
-.feedback-form input:focus, .feedback-form select:focus, .feedback-form textarea:focus, .feedback-reply-form textarea:focus { border-color: #7fa64a; box-shadow: 0 0 0 3px #eaf1df; }
+.feedback-form input:focus, .feedback-form select:focus, .feedback-form textarea:focus, .feedback-category-filter:focus, .feedback-reply-form textarea:focus { border-color: #7fa64a; box-shadow: 0 0 0 3px #eaf1df; }
 .feedback-message-label { grid-column: 1 / -1; }
 .feedback-submit-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .feedback-submit-row small { color: #929b95; font-size: 9px; }
@@ -482,7 +490,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .audit-values > div { min-width: 0; }
 .audit-values b { font-size: 8px; text-transform: uppercase; }
 .audit-values pre { max-height: 200px; overflow: auto; padding: 8px; border-radius: 7px; color: #58635b; background: #f5f6f3; font-size: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.unit-management-link { margin: -4px 0 15px; }
 .inventory-tool-page { min-height: 100vh; padding: 30px clamp(18px, 4vw, 56px); color: #25352c; background: #f7f8f5; }
 .inventory-tool-header { max-width: 1440px; margin: 0 auto 24px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
 .inventory-tool-header > div { flex: 1; }

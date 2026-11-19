@@ -1,16 +1,16 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ArrowLeft, ArrowLeftRight, ArrowRight, Award, ClipboardList, Clock3, Download, Gauge, Package, Printer, Search, ShieldAlert } from "lucide-react";
-import { downloadCsv } from "@/lib/csv.mjs";
+import { ArrowLeft, ArrowLeftRight, ArrowRight, Award, ClipboardList, Clock3, Gauge, Package, PackageX, Printer, Search, ShieldAlert } from "lucide-react";
 import { formatManilaDateTime } from "@/lib/datetime.mjs";
 import { createReportPrintHtml } from "@/lib/report-print.mjs";
 
 const REPORT_TYPES = [
   { id: "utilization", title: "Utilization", description: "Borrowed unit-days against available unit-days." },
   { id: "most_borrowed", title: "Most borrowed", description: "Top 20 equipment by borrowing count." },
-  { id: "damage_loss", title: "Damaged or loss", description: "Reported units grouped by resolution status and equipment." },
   { id: "overdue", title: "Overdue", description: "Current overdue items grouped by equipment and borrower." },
+  { id: "damage", title: "Damaged items", description: "Borrower-submitted damage reports and the comment recorded for each item." },
+  { id: "loss", title: "Lost items", description: "Borrower-submitted loss reports and the comment recorded for each item." },
   { id: "return_history", title: "History", description: "Recorded return date, time, and condition for each item." },
 ];
 
@@ -46,6 +46,42 @@ function initialStartDate() {
 }
 
 async function loadReport(supabase, reportId, startDate, endDate, page = 0, exportReport = false) {
+  if (reportId === "damage" || reportId === "loss") {
+    const { data, error } = await supabase.rpc("list_damage_loss_reports");
+    if (error) throw error;
+    if (!Array.isArray(data)) throw new Error("Damage and loss reports were returned in an invalid format.");
+
+    const filteredRows = data.filter((report) => {
+      const reportDate = String(report.created_at || "").slice(0, 10);
+      return report.report_type === reportId
+        && (!startDate || reportDate >= startDate)
+        && (!endDate || reportDate <= endDate);
+    });
+    const headers = ["Reported at", "Asset code", "Equipment", "Borrower", "Email", "Affected quantity", "Borrower comment", "Resolution status", "Resolution notes"];
+    const allRows = filteredRows.map((report) => [
+      formatManilaDateTime(report.created_at),
+      report.asset_code || "—",
+      report.equipment_name || "—",
+      report.borrower_name || "—",
+      report.borrower_email || "—",
+      Number(report.quantity_affected || 1),
+      report.description || "No comment recorded",
+      String(report.resolution_status || "open").replaceAll("_", " "),
+      report.resolution_notes || "—",
+    ]);
+    const pageSize = 100;
+    const pageRows = exportReport
+      ? allRows.slice(0, 5000)
+      : allRows.slice(page * pageSize, (page + 1) * pageSize);
+    return {
+      headers,
+      rows: pageRows,
+      page_size: pageSize,
+      total_count: allRows.length,
+      truncated: exportReport && allRows.length > 5000,
+    };
+  }
+
   const request = reportId === "return_history"
     ? supabase.rpc("get_phase7_return_history_report", {
       p_start_date: startDate || null,
@@ -78,6 +114,18 @@ async function loadReportRows(supabase, reportId, startDate, endDate) {
   return { rows, totalCount };
 }
 
+function formatLoadError(error) {
+  const message = typeof error?.message === "string" && error.message.trim()
+    ? error.message.trim()
+    : "Unknown backend error.";
+  const diagnostics = [
+    typeof error?.code === "string" && error.code.trim() ? `code: ${error.code.trim()}` : "",
+    typeof error?.details === "string" && error.details.trim() ? `details: ${error.details.trim()}` : "",
+    typeof error?.hint === "string" && error.hint.trim() ? `hint: ${error.hint.trim()}` : "",
+  ].filter(Boolean).join("; ");
+  return `${message}${diagnostics ? ` (${diagnostics})` : ""}`;
+}
+
 function MetricCard({ label, value, detail, Icon, color }) {
   return (
     <article className="metric-card">
@@ -91,8 +139,6 @@ function MetricCard({ label, value, detail, Icon, color }) {
 const OVERVIEW_REPORTS = [
   { id: "utilization", label: "Utilization", Icon: Gauge, color: "metric-green" },
   { id: "most_borrowed", label: "Most borrowed", Icon: Award, color: "metric-amber" },
-  { id: "damage_loss", label: "Damaged or loss", Icon: ShieldAlert, color: "metric-rose" },
-  { id: "overdue", label: "Overdue", Icon: Clock3, color: "metric-blue" },
 ];
 
 export function OverviewReportCards({ supabase, onSelectReport }) {
@@ -135,10 +181,6 @@ export function OverviewReportCards({ supabase, onSelectReport }) {
         detail: topRow ? `${Number(topRow[2] || 0)} borrowings · Last 30 days` : "Last 30 days",
       };
     }
-    if (id === "damage_loss") {
-      const total = result.rows.reduce((sum, row) => sum + Number(row[3] || 0) + Number(row[4] || 0), 0);
-      return { value: total, detail: "Last 30 days" };
-    }
     return { value: result.totalCount, detail: "Last 30 days" };
   }
 
@@ -169,13 +211,13 @@ export function OverviewStatistics({ supabase, isManager, borrowerId, pendingReq
     async function loadStatistics() {
       setStatistics(null);
       if (isManager) {
-        const today = dateValue(new Date());
+        const endDate = manilaDateValue();
+        const startDate = manilaDateDaysAgo(29, endDate);
         const reportCalls = [
-          ["utilization", initialStartDate(), today],
-          ["overdue", dateDaysAgo(365), today],
-          ["damage_loss", initialStartDate(), today],
+          ["utilization", startDate, endDate],
+          ["overdue", dateDaysAgo(365), dateValue(new Date())],
         ];
-        const [reports, borrowedResult] = await Promise.all([
+        const [reports, borrowedResult, damageLossResult] = await Promise.all([
           Promise.all(reportCalls.map(async ([id, start, end]) => {
             try {
               return [id, await loadReport(supabase, id, start, end)];
@@ -187,15 +229,29 @@ export function OverviewStatistics({ supabase, isManager, borrowerId, pendingReq
           supabase.from("borrowings")
             .select("borrowing_id", { count: "exact", head: true })
             .in("transaction_status", ["released", "overdue"]),
+          supabase.rpc("list_damage_loss_reports"),
         ]);
         if (!active) return;
         if (borrowedResult.error) console.error("The currently borrowed count could not be loaded:", borrowedResult.error);
+        if (damageLossResult.error) console.error("The damaged and lost item counts could not be loaded:", damageLossResult.error);
         const reportData = Object.fromEntries(reports);
+        const damageLossReports = damageLossResult.error || !Array.isArray(damageLossResult.data)
+          ? null
+          : damageLossResult.data.filter((report) => {
+            const reportDate = String(report.created_at || "").slice(0, 10);
+            return reportDate >= startDate && reportDate <= endDate;
+          });
+        const affectedQuantity = (reportType) => damageLossReports === null
+          ? null
+          : damageLossReports
+            .filter((report) => report.report_type === reportType)
+            .reduce((total, report) => total + Number(report.quantity_affected || 1), 0);
         setStatistics({
           totalEquipment: reportData.utilization?.total_count ?? null,
           currentlyBorrowed: borrowedResult.error ? null : borrowedResult.count || 0,
           overdue: reportData.overdue?.total_count ?? null,
-          damageLoss: reportData.damage_loss?.total_count ?? null,
+          damagedItems: affectedQuantity("damage"),
+          lostItems: affectedQuantity("loss"),
         });
         return;
       }
@@ -240,8 +296,9 @@ export function OverviewStatistics({ supabase, isManager, borrowerId, pendingReq
           <MetricCard label="Total equipment" value={metricValue(statistics?.totalEquipment)} detail="Active inventory records" Icon={Package} color="metric-green" />
           <MetricCard label="Currently borrowed" value={metricValue(statistics?.currentlyBorrowed)} detail="Released or overdue borrowings" Icon={ArrowLeftRight} color="metric-amber" />
           <MetricCard label="Overdue" value={metricValue(statistics?.overdue)} detail="Overdue equipment/borrower groups" Icon={Clock3} color="metric-rose" />
+          <MetricCard label="Damaged items" value={metricValue(statistics?.damagedItems)} detail="Affected items · Last 30 days" Icon={ShieldAlert} color="metric-rose" />
+          <MetricCard label="Lost items" value={metricValue(statistics?.lostItems)} detail="Affected items · Last 30 days" Icon={PackageX} color="metric-blue" />
           <MetricCard label="Pending requests" value={loading ? "—" : pendingRequestCount} detail="Borrowing and reservation requests" Icon={ClipboardList} color="metric-blue" />
-          <MetricCard label="Damaged or lost" value={metricValue(statistics?.damageLoss)} detail="Equipment/status groups · 30 days" Icon={ShieldAlert} color="metric-rose" />
         </>
       ) : (
         <>
@@ -271,7 +328,7 @@ export function ReportsWorkspace({ supabase, initialReportId = "utilization" }) 
     loadReport(supabase, activeReportId, startDate, endDate, pages[activeReportId] || 0).then((data) => {
       if (active) setReports((current) => ({ ...current, [activeReportId]: data }));
     }).catch((loadError) => {
-      console.error("Reports could not be loaded:", loadError);
+      console.error(`Reports could not be loaded: ${formatLoadError(loadError)}`);
       if (active) setError("Reports are unavailable right now.");
     }).finally(() => {
       if (active) setLoading(false);
@@ -363,7 +420,7 @@ export function ReportsWorkspace({ supabase, initialReportId = "utilization" }) 
                   onClick={() => exportReport(report)} disabled={loading || Boolean(exporting)}>
                   <Printer size={14} /> {exporting === report.id ? "Preparing…" : "Download PDF"}
                 </button>
-                <small>Opens print settings; choose Save as PDF. Contains personal data.</small>
+                <small>Opens print settings; choose Save as PDF. Standard PDFs can be edited and are not digitally signed. Contains personal data.</small>
               </div>
             </div>
             {loading && !result ? <p className="phase7-empty">Loading report…</p> : rows.length === 0
@@ -385,7 +442,7 @@ export function ReportsWorkspace({ supabase, initialReportId = "utilization" }) 
                   disabled={!pages[report.id]}><ArrowLeft size={15} /></button>
                 <button className="button-icon" type="button" aria-label="Next page" title="Next page"
                   onClick={() => setPages((current) => ({ ...current, [report.id]: (current[report.id] || 0) + 1 }))}
-                  disabled={rows.length < 100}><ArrowRight size={15} /></button>
+                  disabled={((pages[report.id] || 0) + 1) * 100 >= Number(result?.total_count || 0)}><ArrowRight size={15} /></button>
               </div>
             </nav>}
           </section>
@@ -437,9 +494,15 @@ export function AuditLogWorkspace({ supabase, isAdmin }) {
   }
 
   async function exportHistory() {
-    setExporting(true);
     setError("");
     setNotice("");
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      setError("Allow pop-ups to open the PDF audit log.");
+      return;
+    }
+    printWindow.opener = null;
+    setExporting(true);
     try {
       const { data, error: exportError } = await supabase.rpc("get_phase7_audit_history", {
         p_page: 0,
@@ -454,12 +517,28 @@ export function AuditLogWorkspace({ supabase, isAdmin }) {
       const rows = data.rows || [];
       const values = rows.map((row) => [formatManilaDateTime(row.event_time), row.actor_id, row.event_type, row.entity_type,
         row.entity_id, row.source_table || row.source, JSON.stringify(row.before_values), JSON.stringify(row.after_values)]);
-      downloadCsv("rmmc-audit-history.csv", [AUDIT_HEADERS, ...values]);
+      printWindow.document.open();
+      printWindow.document.write(createReportPrintHtml({
+        title: "Audit log",
+        description: `${isAdmin ? "Canonical events and read-only legacy history." : "Borrowing-related audit events."}${filters.actor ? ` Actor: ${filters.actor}.` : ""}${filters.event ? ` Event type: ${filters.event}.` : ""}${filters.search ? ` Search: ${filters.search}.` : ""}`,
+        startDate: filters.start,
+        endDate: filters.end,
+        generatedAt: formatManilaDateTime(new Date()),
+        headers: AUDIT_HEADERS,
+        rows: values,
+        truncated: data.truncated,
+      }));
+      printWindow.document.close();
+      printWindow.focus();
+      window.setTimeout(() => {
+        if (!printWindow.closed) printWindow.print();
+      }, 250);
       setNotice(data.truncated
-        ? `Export capped at 5,000 rows. ${data.total_count - 5000} additional rows were not included.`
-        : `Audit export downloaded (${rows.length} rows).`);
+        ? `PDF print view opened. It includes the first 5,000 rows; ${data.total_count - 5000} additional rows were not included.`
+        : `PDF print view opened for ${rows.length} audit events. Choose Save as PDF to download it.`);
     } catch (exportError) {
       console.error("The audit export could not be created:", exportError);
+      printWindow.close();
       setError("The audit export could not be created. Please try again.");
     } finally {
       setExporting(false);
@@ -473,9 +552,9 @@ export function AuditLogWorkspace({ supabase, isAdmin }) {
         <div className="phase7-export-control">
           <button className="button-secondary" type="button" title="This file contains personal data. Handle it accordingly."
             onClick={exportHistory} disabled={loading || exporting}>
-            <Download size={14} /> {exporting ? "Preparing…" : "Export CSV"}
+            <Printer size={14} /> {exporting ? "Preparing…" : "Download PDF"}
           </button>
-          <small>Contains personal data. Handle accordingly.</small>
+          <small>Opens print settings; choose Save as PDF. Standard PDFs can be edited and are not digitally signed. Contains personal data.</small>
         </div>
       </div>
       <div className="phase7-audit-filters">
