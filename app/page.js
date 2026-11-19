@@ -1,0 +1,3143 @@
+"use client";
+
+import {
+  Activity,
+  ArrowLeft,
+  ArrowLeftRight,
+  ArrowRight,
+  ArrowUpRight,
+  Bell,
+  CalendarDays,
+  Camera,
+  Check,
+  CheckCircle2,
+  ClipboardList,
+  Clock3,
+  Download,
+  FileBarChart,
+  Filter,
+  HardDrive,
+  Laptop,
+  LogOut,
+  Menu,
+  MessageSquare,
+  Package,
+  Plus,
+  Search,
+  Send,
+  Settings,
+  ShieldCheck,
+  Pencil,
+  Trash2,
+  UserRound,
+  UsersRound,
+  X,
+} from "lucide-react";
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createClient as createAuthClient } from "@supabase/supabase-js";
+import { createClient } from "@/lib/supabase/client";
+import { DEPARTMENTS } from "@/lib/departments.mjs";
+import { formatManilaDate, formatManilaDateTime } from "@/lib/datetime.mjs";
+import InstallAppButton from "./install-app-button";
+import { AuditLogWorkspace, OverviewReportCards, OverviewStatistics, ReportsWorkspace } from "./phase7-workspaces";
+
+const MEMBER_NAV_ITEMS = [
+  { id: "equipment", label: "Equipment", icon: Package },
+  { id: "loans", label: "My equipment", icon: ArrowLeftRight },
+  { id: "feedback", label: "Feedback", icon: MessageSquare },
+  { id: "account", label: "Account settings", icon: Settings },
+];
+
+const ADMIN_NAV_ITEMS = [
+  { id: "overview", label: "Overview", icon: Activity },
+  { id: "equipment", label: "Equipment", icon: Package },
+  { id: "currently-borrowed", label: "Equipment tracking", icon: ArrowLeftRight },
+  { id: "reports", label: "Reports", icon: FileBarChart },
+  { id: "audit-log", label: "Audit log", icon: Activity },
+  { id: "feedback", label: "Feedback", icon: MessageSquare },
+  { id: "account", label: "Account settings", icon: Settings },
+];
+
+const CUSTODIAN_NAV_ITEMS = [
+  { id: "overview", label: "Overview", icon: Activity },
+  { id: "equipment", label: "Equipment", icon: Package },
+  { id: "currently-borrowed", label: "Equipment tracking", icon: ArrowLeftRight },
+  { id: "reports", label: "Reports", icon: FileBarChart },
+  { id: "requests", label: "Requests", icon: ClipboardList },
+  { id: "pending-accounts", label: "Pending accounts", icon: ShieldCheck },
+  { id: "feedback", label: "Feedback", icon: MessageSquare },
+  { id: "account", label: "Account settings", icon: Settings },
+];
+
+const ADMIN_ITEMS = [
+  { id: "requests", label: "Manage requests", icon: ClipboardList },
+  { id: "pending-accounts", label: "Pending accounts", icon: ShieldCheck },
+  { id: "members", label: "Members & roles", icon: UsersRound },
+];
+
+const ACTIVE_BORROWING = ["requested", "approved", "released", "overdue", "return_requested"];
+const PRIVACY_NOTICE_VERSION = "2026-11-03-v1";
+const PENDING_BORROWER_MESSAGE = "No active borrower record is linked to your account. An administrator or property custodian must approve your borrower access before you can submit or view borrowing requests.";
+
+const dateLabel = (value) =>
+  value ? formatManilaDate(value) : "—";
+
+const dateTimeLabel = (value) =>
+  value ? formatManilaDateTime(value) : "—";
+
+async function encodeImageToWebp(file, label, maxDimension) {
+  if (!(file instanceof File) || file.size === 0) return null;
+  if (!new Set(["image/jpeg", "image/png", "image/webp"]).has(file.type)) {
+    throw new Error(`Choose a JPEG, PNG, or WebP ${label}.`);
+  }
+  if (file.size > 5 * 1024 * 1024) throw new Error(`${label} images must be 5 MB or smaller.`);
+
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    throw new Error(`The selected ${label} is not a valid image.`);
+  }
+  if (!bitmap.width || !bitmap.height || bitmap.width * bitmap.height > 20_000_000) {
+    bitmap.close();
+    throw new Error(`Choose an image with 20 megapixels or fewer.`);
+  }
+
+  const scale = Math.min(1, maxDimension / bitmap.width, maxDimension / bitmap.height);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  const context = canvas.getContext("2d");
+  if (!context) {
+    bitmap.close();
+    throw new Error(`The selected ${label} could not be processed.`);
+  }
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  const encodedImage = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", 0.9));
+  if (!encodedImage || encodedImage.size > 5 * 1024 * 1024) {
+    throw new Error(`The processed ${label} is too large to upload.`);
+  }
+  return encodedImage;
+}
+
+async function uploadItemConditionPhoto(supabase, userId, file, label) {
+  const encodedImage = await encodeImageToWebp(file, label, 2048);
+  if (!encodedImage) return null;
+  const path = `${userId}/${crypto.randomUUID()}.webp`;
+  const { error } = await supabase.storage
+    .from("item-condition-photos")
+    .upload(path, new File([encodedImage], "condition.webp", { type: "image/webp" }), {
+      contentType: "image/webp",
+      cacheControl: "3600",
+    });
+  if (error) throw error;
+  return path;
+}
+
+function ProfileAvatar({ name, photoUrl, className = "avatar" }) {
+  return (
+    <span className={className}>
+      {photoUrl ? <img src={photoUrl} alt={`${name}'s profile`} /> : <UserRound size={18} aria-hidden="true" />}
+    </span>
+  );
+}
+
+const getErrorMessage = (error) => {
+  const message = error?.message || "Something went wrong. Please try again.";
+  if (/Your borrower account is pending approval or inactive|No active borrower record matches your signed-in email/i.test(message)) {
+    console.error("A borrower request was blocked by account access:", error);
+    return PENDING_BORROWER_MESSAGE;
+  }
+  if (/email rate limit exceeded|too many requests/i.test(message)) {
+    return "Email delivery is temporarily limited. Please try again later.";
+  }
+  if (/error sending confirmation email|error sending.*email/i.test(message)) {
+    return "The confirmation email could not be sent. Please try again later.";
+  }
+  if (error?.details || error?.hint || /^[0-9A-Z]{5}$/i.test(error?.code || "")
+    || /permission denied|violates .*constraint|row-level security|relation .* does not exist|column .* does not exist|schema cache|could not find the .* function|function .* does not exist|sqlstate|postgres|database error|failed to fetch|fetch failed|pgrst/i.test(message)) {
+    console.error("A backend operation failed:", error);
+    return "The action could not be completed. Please try again.";
+  }
+  return message;
+};
+
+function StatusPill({ value }) {
+  const labels = {
+    available: "Available",
+    out_of_stock: "Out of stock",
+    reserved: "Reserved",
+    maintenance: "Maintenance",
+    retired: "Retired",
+    pending: "Pending review",
+    requested: "Requested",
+    approved: "Approved",
+    borrowed: "Borrowed",
+    released: "Released",
+    checked_out: "On loan",
+    return_requested: "Return requested",
+    returned: "Returned",
+    overdue: "Overdue",
+    unavailable: "Unavailable",
+    rejected: "Declined",
+    cancelled: "Cancelled",
+    fulfilled: "Fulfilled",
+    expired: "Expired",
+  };
+  return <span className={`pill pill-${value}`}>{labels[value] || value?.replaceAll("_", " ")}</span>;
+}
+
+function SignIn({ supabase, configError }) {
+  const [mode, setMode] = useState("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [token, setToken] = useState("");
+  const [isCodeSent, setIsCodeSent] = useState(false);
+  const [otpCooldown, setOtpCooldown] = useState(0);
+  const [name, setName] = useState("");
+  const [department, setDepartment] = useState("");
+  const [course, setCourse] = useState("");
+  const [gender, setGender] = useState("");
+  const [privacyAccepted, setPrivacyAccepted] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (otpCooldown <= 0) return undefined;
+    const timer = window.setTimeout(() => setOtpCooldown((remaining) => remaining - 1), 1000);
+    return () => window.clearTimeout(timer);
+  }, [otpCooldown]);
+
+  async function handleSendOtp() {
+    if (otpCooldown > 0) throw new Error(`Please wait ${otpCooldown} seconds before requesting another code.`);
+    const { error: otpError } = await supabase.auth.signInWithOtp({
+      email: email.trim().toLowerCase(),
+      options: { shouldCreateUser: false },
+    });
+
+    if (otpError) throw otpError;
+    setOtpCooldown(60);
+    setIsCodeSent(true);
+    setNotice(`A one-time code was sent to ${email}.`);
+  }
+
+  async function handleVerifyOtp() {
+    const { error: otpError } = await supabase.auth.verifyOtp({
+      email: email.trim().toLowerCase(),
+      token,
+      type: mode === "signup" ? "signup" : "email",
+    });
+
+    if (otpError) throw otpError;
+  }
+
+  async function handleResendCode() {
+    if (mode === "signup") {
+      const { error: resendError } = await supabase.auth.resend({
+        type: "signup",
+        email: email.trim().toLowerCase(),
+      });
+
+      if (resendError) throw resendError;
+      setOtpCooldown(60);
+      setNotice(`A verification code was sent to ${email}.`);
+      return;
+    }
+
+    await handleSendOtp();
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    setNotice("");
+
+    try {
+      if (!supabase) throw new Error(configError);
+      if (mode === "signin") {
+        if (isCodeSent) {
+          await handleVerifyOtp();
+        } else {
+          const validationClient = createAuthClient(
+            process.env.NEXT_PUBLIC_SUPABASE_URL,
+            process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+            { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } },
+          );
+          const { error: passwordError } = await validationClient.auth.signInWithPassword({
+            email: email.trim().toLowerCase(),
+            password,
+          });
+          if (passwordError) throw passwordError;
+          const { error: signOutError } = await validationClient.auth.signOut({ scope: "local" });
+          if (signOutError) throw signOutError;
+          const { error: otpError } = await supabase.auth.signInWithOtp({
+            email: email.trim().toLowerCase(),
+            options: { shouldCreateUser: false },
+          });
+          if (otpError) throw otpError;
+          setOtpCooldown(60);
+          setIsCodeSent(true);
+          setNotice(`Password confirmed. A one-time verification code was sent to ${email}.`);
+          setPassword("");
+        }
+      } else if (mode === "signup") {
+        if (isCodeSent) {
+          await handleVerifyOtp();
+        } else {
+          if (!privacyAccepted) throw new Error("Read and accept the privacy notice before creating your account.");
+          if (password.length < 8) throw new Error("Passwords must contain at least 8 characters.");
+          const { data: signupData, error: signUpError } = await supabase.auth.signUp({
+            email: email.trim().toLowerCase(),
+            password,
+            options: { data: {
+              display_name: name.trim(),
+              department: department.trim(),
+              course: course.trim(),
+              gender: gender.trim(),
+              privacy_consent: "true",
+              privacy_consent_version: PRIVACY_NOTICE_VERSION,
+            } },
+          });
+          if (signUpError) throw signUpError;
+          if (signupData.session || signupData.user?.email_confirmed_at) {
+            const { error: signOutError } = await supabase.auth.signOut();
+            if (signOutError) throw signOutError;
+            throw new Error("Email confirmation is disabled in Supabase Auth. Enable it before allowing new accounts.");
+          }
+          setIsCodeSent(true);
+          setNotice(`A verification code was sent to ${email}.`);
+        }
+      } else if (mode === "reset") {
+        const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
+          redirectTo: `${window.location.origin}/reset-password`,
+        });
+        if (resetError) throw resetError;
+        setNotice("If an account exists for that address, a password reset link is on its way.");
+      }
+    } catch (submissionError) {
+      const message = getErrorMessage(submissionError);
+      if (mode === "signin") {
+        setError("Unable to sign in with those details. Check your credentials or verification code and try again.");
+      } else if (mode === "reset") {
+        setError("If an account exists for that address, a password reset email may be sent. Please try again later.");
+      } else {
+        setError(mode === "signup" && isCodeSent ? `Invalid or expired code: ${message}` : message);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resendOtp() {
+    setBusy(true);
+    setError("");
+    setNotice("");
+
+    try {
+      if (!supabase) throw new Error(configError);
+      await handleResendCode();
+    } catch (submissionError) {
+      setError(`Error sending code: ${getErrorMessage(submissionError)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function changeMode(nextMode) {
+    setMode(nextMode);
+    setIsCodeSent(false);
+    setOtpCooldown(0);
+    setToken("");
+    setPrivacyAccepted(false);
+    setError("");
+    setNotice("");
+  }
+
+  return (
+    <main className="auth-page">
+      <section className="auth-showcase">
+        <Link className="auth-brand" href="/" aria-label="RMMC-MI equipment home">
+          <span className="brand-mark"><HardDrive size={21} /></span>
+          <span>RMMC <b>·</b> MI</span>
+        </Link>
+        <div className="showcase-copy">
+          <p className="eyebrow">Equipment, accounted for</p>
+          <h1>Better care for the tools that move us forward.</h1>
+          <p>One dependable place to find equipment, request what you need, and keep every return on track.</p>
+          <div className="showcase-stats">
+            <div><strong>01</strong><span>Browse available gear</span></div>
+            <div><strong>02</strong><span>Request in a few clicks</span></div>
+            <div><strong>03</strong><span>Keep your team moving</span></div>
+          </div>
+        </div>
+        <p className="auth-copyright">RMMC-MI EQUIPMENT SERVICES · SECURE ACCESS</p>
+        <div className="showcase-orbit" />
+      </section>
+      <section className="auth-form-side">
+        <div className="auth-mobile-brand">
+          <span className="brand-mark"><HardDrive size={20} /></span>
+          <span>RMMC <b>·</b> MI</span>
+        </div>
+        <div className="auth-card">
+          <div className="auth-heading">
+            <p className="eyebrow">{mode === "signup" ? isCodeSent ? "Verify your email" : "Get started" : mode === "reset" ? "Account recovery" : isCodeSent ? "Check your inbox" : "Welcome back"}</p>
+            <h2>{mode === "signup" ? isCodeSent ? "Enter your verification code" : "Create your account" : mode === "reset" ? "Reset your password" : isCodeSent ? "Enter your sign-in code" : "Sign in to your workspace"}</h2>
+            <p>{mode === "signup" ? isCodeSent ? `Enter the verification code sent to ${email}.` : "Sign up with your email address. After verifying it, an administrator or property custodian must approve your account before you can borrow equipment." : mode === "reset" ? "We’ll email you a secure password reset link." : isCodeSent ? `Enter the verification code sent to ${email} after your password was confirmed.` : "Enter your email and password. We’ll send a verification code after your credentials are confirmed."}</p>
+          </div>
+          <form className="auth-form" onSubmit={submit}>
+            {mode === "signup" && !isCodeSent && (
+              <label>
+                <span>Full name</span>
+                <input autoComplete="name" value={name} onChange={(event) => setName(event.target.value)} placeholder="Your name" maxLength={120} required />
+              </label>
+            )}
+            <label>
+              <span>Email</span>
+              <input type="email" autoComplete="email" autoCapitalize="none" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" disabled={isCodeSent && (mode === "signin" || mode === "signup")} required />
+            </label>
+            {mode === "signin" && !isCodeSent && (
+              <label>
+                <span>Password</span>
+                <input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required />
+              </label>
+            )}
+            {(mode === "signin" || mode === "signup") && isCodeSent && (
+              <label>
+                <span>{mode === "signup" ? "Verification code" : "One-time code"}</span>
+                <input type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} value={token} onChange={(event) => setToken(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="Enter your 6-digit code" required />
+              </label>
+            )}
+            {mode === "signup" && !isCodeSent && (
+              <>
+                <div className="form-row">
+                  <label>
+                    <span>Department</span>
+                    <select className="auth-gender-select" value={department} onChange={(event) => setDepartment(event.target.value)} required>
+                      <option value="">Select department</option>
+                      {DEPARTMENTS.map((item) => <option key={item} value={item}>{item}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    <span>Course</span>
+                    <input value={course} onChange={(event) => setCourse(event.target.value)} placeholder="e.g. BSIT" maxLength={120} required />
+                  </label>
+                </div>
+                <label>
+                  <span>Gender</span>
+                  <select className="auth-gender-select" value={gender} onChange={(event) => setGender(event.target.value)} required>
+                    <option value="">Select gender</option>
+                    <option value="Female">Female</option>
+                    <option value="Male">Male</option>
+                    <option value="Non-binary">Non-binary</option>
+                    <option value="Prefer not to say">Prefer not to say</option>
+                    <option value="Other">Other</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Password</span>
+                  <input type="password" autoComplete="new-password" minLength={8} maxLength={128} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Use at least 8 characters" required />
+                </label>
+                <label className="checkbox-label auth-consent-label">
+                  <input type="checkbox" checked={privacyAccepted} onChange={(event) => setPrivacyAccepted(event.target.checked)} />
+                  <span>I have read the <Link href="/privacy" target="_blank" rel="noopener noreferrer">privacy notice</Link> and consent to the described use of my information.</span>
+                </label>
+              </>
+            )}
+            {error && <p className="feedback feedback-error" role="alert">{error}</p>}
+            {notice && <p className="feedback feedback-success" role="status">{notice}</p>}
+            {configError && <p className="setup-hint">Add your Supabase URL and publishable key in <code>.env.local</code>, then restart the dev server.</p>}
+            {mode === "signin" && (
+              <div className="auth-options">
+                <span>Protected by Supabase authentication</span>
+                {isCodeSent
+                  ? <button type="button" onClick={resendOtp} disabled={busy || otpCooldown > 0}>{otpCooldown > 0 ? `Resend in ${otpCooldown}s` : "Resend code"}</button>
+                  : <button type="button" onClick={() => changeMode("reset")}>Forgot password?</button>}
+              </div>
+            )}
+            {mode === "signup" && isCodeSent && (
+              <div className="auth-options">
+                <span>Check your inbox for the verification code.</span>
+                <button type="button" onClick={resendOtp} disabled={busy || otpCooldown > 0}>{otpCooldown > 0 ? `Resend in ${otpCooldown}s` : "Resend code"}</button>
+              </div>
+            )}
+            <button className="auth-submit" disabled={busy || Boolean(configError)} type="submit">
+              {busy ? "Please wait…" : mode === "signup" ? isCodeSent ? "Verify code" : "Create account" : mode === "reset" ? "Send reset link" : isCodeSent ? "Verify code" : "Continue securely"}
+              <ArrowUpRight size={16} />
+            </button>
+          </form>
+          <p className="auth-switch">
+            {mode === "signin" && isCodeSent
+              ? <button type="button" onClick={() => { setIsCodeSent(false); setToken(""); setError(""); setNotice(""); }}>Use a different email</button>
+              : mode === "reset"
+                ? <button type="button" onClick={() => changeMode("signin")}>Back to sign in</button>
+                : <>
+                  {mode === "signin" ? "New to the system?" : "Already have an account?"}
+                  <button type="button" onClick={() => changeMode(mode === "signin" ? "signup" : "signin")}>
+                    {mode === "signin" ? "Request access" : "Sign in"}
+                  </button>
+                </>}
+          </p>
+          <p className="auth-terms">Use of this system is subject to your institution’s equipment policies.</p>
+          <InstallAppButton />
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function EmptyState({ title, copy, action, onAction }) {
+  return (
+    <div className="empty-panel">
+      <span><Package size={21} /></span>
+      <h2>{title}</h2>
+      <p>{copy}</p>
+      {action && <button className="button-primary" onClick={onAction}>{action}</button>}
+    </div>
+  );
+}
+
+function EquipmentCard({ item, onBorrow, onReserve, canRequest = true }) {
+  const canBorrow = ["available", "checked_out"].includes(item.status) && item.available_quantity > 0;
+  const canReserve = ["available", "checked_out"].includes(item.status) && item.quantity > 0;
+  return (
+    <article className="equipment-card">
+      <div className={`equipment-art art-${(item.category || "general").toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}>
+        {item.image_url ? <img src={item.image_url} alt="" /> : <Laptop size={42} strokeWidth={1.2} />}
+        <StatusPill value={item.quantity === 0 || item.available_quantity === 0 ? "out_of_stock" : item.status} />
+      </div>
+      <div className="card-body">
+        <div className="card-category">{item.category || "General"}</div>
+        <h2>{item.name}</h2>
+        <div className="item-meta">
+          <span>{item.asset_tag}</span><i /><span>{item.location || "Storage not set"}</span>
+        </div>
+        <p className="item-quantity">Quantity: <strong>{item.available_quantity ?? "—"}/{item.quantity ?? 0}</strong></p>
+        {item.description && <p className="item-description">{item.description}</p>}
+        {canRequest && <div className="card-actions">
+          <button className="button-primary" disabled={!canBorrow} onClick={() => onBorrow(item)}>
+            {canBorrow ? "Request to borrow" : item.available_quantity === null ? "Availability unavailable" : item.quantity === 0 || item.available_quantity === 0 ? "Out of stock" : item.status === "maintenance" ? "Under maintenance" : "Unavailable"}
+          </button>
+          {canReserve && <button className="button-icon" aria-label={`Reserve ${item.name}`} title="Reserve" onClick={() => onReserve(item)}><CalendarDays size={17} /></button>}
+        </div>}
+      </div>
+    </article>
+  );
+}
+
+export default function Home() {
+  const [supabase, setSupabase] = useState(null);
+  const [configError, setConfigError] = useState("");
+  const [user, setUser] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [equipment, setEquipment] = useState([]);
+  const [equipmentTotalCount, setEquipmentTotalCount] = useState(0);
+  const [equipmentPageCursors, setEquipmentPageCursors] = useState([null]);
+  const [equipmentPageIndex, setEquipmentPageIndex] = useState(0);
+  const [categoryOptions, setCategoryOptions] = useState([]);
+  const [borrowings, setBorrowings] = useState([]);
+  const [currentlyBorrowed, setCurrentlyBorrowed] = useState([]);
+  const [currentUnitTags, setCurrentUnitTags] = useState([]);
+  const [reservations, setReservations] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [pendingAccounts, setPendingAccounts] = useState([]);
+  const [feedbackThreads, setFeedbackThreads] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [notificationsPage, setNotificationsPage] = useState(0);
+  const [notificationSearch, setNotificationSearch] = useState("");
+  const [borrowingsPage, setBorrowingsPage] = useState(0);
+  const [borrowingsSearch, setBorrowingsSearch] = useState("");
+  const [unreadNotificationCount, setUnreadNotificationCount] = useState(0);
+  const [pendingRequestCount, setPendingRequestCount] = useState(0);
+  const [notificationOpen, setNotificationOpen] = useState(false);
+  const [activeAgreement, setActiveAgreement] = useState(null);
+  const [acceptedAgreementVersion, setAcceptedAgreementVersion] = useState(null);
+  const [borrowerId, setBorrowerId] = useState(null);
+  const [recoveryMode, setRecoveryMode] = useState(false);
+  const [view, setView] = useState("overview");
+  const [selectedReport, setSelectedReport] = useState("utilization");
+  const [search, setSearch] = useState("");
+  const [searchShortcut, setSearchShortcut] = useState("Ctrl K");
+  const searchInputRef = useRef(null);
+  const [category, setCategory] = useState("All equipment");
+  const [modal, setModal] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const [mobileNav, setMobileNav] = useState(false);
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+
+  useEffect(() => {
+    try {
+      setSupabase(createClient());
+    } catch (clientError) {
+      console.error("The Supabase client could not be initialized:", clientError);
+      setConfigError("The sign-in service is unavailable right now. Please try again later.");
+      setLoading(false);
+    }
+  }, []);
+
+  const loadData = useCallback(async (client, currentUser) => {
+    if (!client || !currentUser) return;
+    setLoading(true);
+    setError("");
+
+    const profileResult = await client.from("profiles").select("*").eq("id", currentUser.id).maybeSingle();
+    if (profileResult.error || !profileResult.data) {
+      const stateResult = profileResult.error ? null : await client.rpc("get_my_account_state");
+      const accountState = stateResult?.data;
+      setProfile(["pending", "inactive"].includes(accountState) ? { account_status: accountState } : null);
+      setEquipment([]);
+      setCategoryOptions([]);
+      setBorrowings([]);
+      setCurrentlyBorrowed([]);
+      setCurrentUnitTags([]);
+      setReservations([]);
+      setMembers([]);
+      setPendingAccounts([]);
+      setFeedbackThreads([]);
+      setNotifications([]);
+      setUnreadNotificationCount(0);
+      setActiveAgreement(null);
+      setAcceptedAgreementVersion(null);
+      setBorrowerId(null);
+      if (profileResult.error) console.error("The profile could not be loaded:", profileResult.error);
+      if (stateResult?.error) console.error("The account state could not be verified:", stateResult.error);
+      setError(profileResult.error
+        ? "Your account information could not be loaded. Please try again."
+        : stateResult?.error
+          ? "Your account information could not be verified. Please try again."
+          : accountState === "none"
+            ? "No profile was found for the signed-in account."
+            : accountState === "active"
+              ? "Your active profile could not be loaded. Contact an administrator."
+              : "");
+      setLoading(false);
+      return;
+    }
+
+    const currentProfile = {
+      ...profileResult.data,
+      display_name: profileResult.data.display_name || profileResult.data.full_name || "",
+      department: profileResult.data.department || "",
+    };
+    if (currentProfile.role === "staff") {
+      const stateResult = await client.rpc("get_my_account_state");
+      if (stateResult.error) {
+        console.error("The account state could not be verified:", stateResult.error);
+      } else if (["pending", "active", "inactive"].includes(stateResult.data)) {
+        currentProfile.account_status = stateResult.data;
+      }
+    }
+    const isAdminUser = currentProfile.role === "admin";
+    const isCustodianUser = currentProfile.role === "property_custodian";
+    const isEquipmentManager = isAdminUser || isCustodianUser;
+    setProfile(currentProfile);
+
+    if (currentProfile.role === "staff" && currentProfile.account_status === "pending") {
+      setEquipment([]);
+      if (categoryOptions.length) setCategoryOptions([]);
+      setBorrowings([]);
+      setCurrentlyBorrowed([]);
+      setCurrentUnitTags([]);
+      setReservations([]);
+      setMembers([]);
+      setPendingAccounts([]);
+      setFeedbackThreads([]);
+      setNotifications([]);
+      setUnreadNotificationCount(0);
+      setActiveAgreement(null);
+      setAcceptedAgreementVersion(null);
+      setBorrowerId(null);
+      setLoading(false);
+      return;
+    }
+
+    if (currentProfile.account_status !== "active") {
+      const [inactiveNotificationsResult, inactiveUnreadResult] = await Promise.all([
+        client.from("notifications").select("*").order("created_at", { ascending: false }).order("notification_id", { ascending: false }).range(notificationsPage * 20, notificationsPage * 20 + 19),
+        client.from("notifications").select("notification_id", { count: "exact", head: true }).eq("is_read", false),
+      ]);
+      if (inactiveNotificationsResult.error || inactiveUnreadResult.error) {
+        if (inactiveNotificationsResult.error) console.error("Account notifications could not be loaded:", inactiveNotificationsResult.error);
+        if (inactiveUnreadResult.error) console.error("The unread notification count could not be loaded:", inactiveUnreadResult.error);
+        setError("Notifications are unavailable right now.");
+      } else {
+        setNotifications(inactiveNotificationsResult.data || []);
+        setUnreadNotificationCount(inactiveUnreadResult.count || 0);
+      }
+      setEquipment([]);
+      setCategoryOptions([]);
+      setBorrowings([]);
+      setCurrentlyBorrowed([]);
+      setReservations([]);
+      setActiveAgreement(null);
+      setAcceptedAgreementVersion(null);
+      setMembers([]);
+      setPendingAccounts([]);
+      setFeedbackThreads([]);
+      setBorrowerId(null);
+      setLoading(false);
+      return;
+    }
+
+    let borrowingQuery = client.from("borrowings")
+      .select("*, borrowers!inner(borrower_id, first_name, middle_name, last_name, email, department), borrowing_items(borrowing_item_id, borrowing_id, equipment_id, item_status, issued_at, returned_at, quantity, released_by, released_at, received_by, condition_at_release, release_photo_path, condition_at_return, return_photo_path, is_overdue, overdue_at, equipment(equipment_id, asset_code, equipment_name, category_id, storage_location, availability_status, tracking_mode, categories(category_name)))")
+      .order("created_at", { ascending: false }).order("borrowing_id", { ascending: false }).range(borrowingsPage * 20, borrowingsPage * 20 + 19);
+    const safeBorrowingSearch = borrowingsSearch.trim().replace(/[\\%,()"]/g, "\\$&");
+    if (safeBorrowingSearch) {
+      borrowingQuery = borrowingQuery.or(
+        `first_name.ilike.${safeBorrowingSearch}%,last_name.ilike.${safeBorrowingSearch}%,email.ilike.${safeBorrowingSearch}%`,
+        { foreignTable: "borrowers" },
+      );
+    }
+    const scopedBorrowingQuery = isCustodianUser
+      ? borrowingQuery.in("transaction_status", ["requested", "approved", "released"])
+      : borrowingQuery;
+    const reservationQuery = client.from("reservations")
+      .select("*, equipment(equipment_id, asset_code, equipment_name, categories(category_name)), borrowers(borrower_id, first_name, middle_name, last_name, email)")
+      .order("created_at", { ascending: false });
+    const scopedReservationQuery = isCustodianUser
+      ? reservationQuery.in("status", ["pending", "approved"])
+      : reservationQuery;
+
+    const [
+      equipmentResult,
+      categoryResult,
+      borrowingResult,
+      borrowerResult,
+      reservationResult,
+      feedbackResult,
+      repliesResult,
+      currentlyBorrowedResult,
+      unitTagsResult,
+      notificationsResult,
+      unreadNotificationsResult,
+      activeAgreementResult,
+      agreementAcceptancesResult,
+    ] = await Promise.all([
+      client.rpc("search_equipment_page", {
+        p_search: search.trim() || null,
+        p_category_id: category === "All equipment" ? null : categoryOptions.find((option) => option.category_name === category)?.category_id || null,
+        p_after_name: equipmentPageCursors[equipmentPageIndex]?.equipment_name || null,
+        p_after_id: equipmentPageCursors[equipmentPageIndex]?.equipment_id || null,
+      }),
+      client.from("categories").select("category_id, category_name").order("category_name"),
+      scopedBorrowingQuery,
+      isEquipmentManager ? Promise.resolve({ data: null, error: null }) : client.rpc("current_borrower_id"),
+      scopedReservationQuery,
+      client.from("feedback_threads").select("*").order("updated_at", { ascending: false }),
+      client.from("feedback_replies").select("*").order("created_at"),
+      isEquipmentManager
+        ? client.rpc("list_equipment_tracking_records")
+        : Promise.resolve({ data: [], error: null }),
+      isEquipmentManager ? Promise.resolve({ data: [], error: null }) : client.rpc("my_current_unit_tags"),
+      (() => {
+        let query = client.from("notifications").select("*")
+          .order("created_at", { ascending: false }).order("notification_id", { ascending: false })
+          .range(notificationsPage * 20, notificationsPage * 20 + 19);
+        const safeSearch = notificationSearch.trim().replace(/[\\%,()"]/g, "\\$&");
+        if (safeSearch) query = query.or(`title.ilike.%${safeSearch}%,message.ilike.%${safeSearch}%`);
+        return query;
+      })(),
+      client.from("notifications").select("notification_id", { count: "exact", head: true }).eq("is_read", false),
+      client.from("borrower_agreement_versions").select("version_id, version_number, title, body_text")
+        .eq("active", true).lte("published_at", new Date().toISOString()).order("version_number", { ascending: false }).limit(1).maybeSingle(),
+      client.from("borrower_agreement_acceptances").select("version_id").eq("user_id", currentUser.id),
+    ]);
+
+    const errors = [];
+    let borrowerMissing = false;
+    if (notificationsResult.error) {
+      errors.push(["Notifications could not be loaded:", notificationsResult.error]);
+      setNotifications([]);
+    } else {
+      setNotifications(notificationsResult.data || []);
+    }
+    if (unreadNotificationsResult.error) {
+      errors.push(["The unread notification count could not be loaded:", unreadNotificationsResult.error]);
+      setUnreadNotificationCount(0);
+    } else {
+      setUnreadNotificationCount(unreadNotificationsResult.count || 0);
+    }
+    if (activeAgreementResult.error) {
+      errors.push(["The borrower agreement could not be loaded:", activeAgreementResult.error]);
+      setActiveAgreement(null);
+    } else {
+      setActiveAgreement(activeAgreementResult.data || null);
+    }
+    if (agreementAcceptancesResult.error) {
+      errors.push(["Agreement acceptance could not be loaded:", agreementAcceptancesResult.error]);
+      setAcceptedAgreementVersion(null);
+    } else {
+      setAcceptedAgreementVersion(
+        (agreementAcceptancesResult.data || []).some((acceptance) =>
+          Number(acceptance.version_id) === Number(activeAgreementResult.data?.version_id))
+          ? activeAgreementResult.data?.version_id ?? null
+          : null,
+      );
+    }
+    if (currentlyBorrowedResult.error) {
+      errors.push(["Equipment tracking records could not be loaded:", currentlyBorrowedResult.error]);
+      setCurrentlyBorrowed([]);
+    }
+    const trackingRows = isEquipmentManager && !currentlyBorrowedResult.error
+      ? currentlyBorrowedResult.data || []
+      : [];
+    if (unitTagsResult.error) errors.push(["Assigned unit tags could not be loaded:", unitTagsResult.error]);
+    setCurrentUnitTags(unitTagsResult.data || []);
+    const photoPaths = [...new Set([
+      currentProfile.profile_photo_path,
+      ...trackingRows.map((item) => item.profile_photo_path),
+    ].filter(Boolean))];
+    let signedPhotosByPath = new Map();
+    if (photoPaths.length) {
+      const signedPhotosResult = await client.storage.from("profile-photos").createSignedUrls(photoPaths, 3600);
+      if (signedPhotosResult.error) {
+        errors.push(["Profile photos could not be loaded:", signedPhotosResult.error]);
+      } else {
+        signedPhotosByPath = new Map((signedPhotosResult.data || [])
+          .filter((item) => item.signedUrl)
+          .map((item) => [item.path, item.signedUrl]));
+      }
+    }
+    setProfile({
+      ...currentProfile,
+      profile_photo_url: signedPhotosByPath.get(currentProfile.profile_photo_path) || null,
+    });
+    setCurrentlyBorrowed(trackingRows.map((item) => ({
+      ...item,
+      profile_photo_url: signedPhotosByPath.get(item.profile_photo_path) || null,
+    })));
+    if (equipmentResult.error) {
+      errors.push(["Equipment could not be loaded:", equipmentResult.error]);
+    } else {
+      setEquipmentTotalCount(equipmentResult.data?.[0]?.total_count || 0);
+      setEquipment((equipmentResult.data || []).map((item) => ({
+        ...item,
+        id: item.equipment_id,
+        name: item.equipment_name,
+        asset_tag: item.asset_code,
+        category: item.category_name || "General",
+        location: item.storage_location || "",
+        status: item.availability_status === "borrowed" ? "checked_out" : item.availability_status,
+        image_url: item.image_url || null,
+        quantity: item.quantity ?? 1,
+        available_quantity: item.available_quantity ?? null,
+      })));
+    }
+    if (categoryResult.error) errors.push(["Equipment categories could not be loaded:", categoryResult.error]);
+    else setCategoryOptions((current) => {
+      const next = categoryResult.data || [];
+      return current.length === next.length && current.every((item, index) => item.category_id === next[index]?.category_id)
+        ? current
+        : next;
+    });
+    if (!isEquipmentManager && borrowerResult.error) {
+      setBorrowerId(null);
+      errors.push(["Your borrower record could not be found:", borrowerResult.error]);
+    } else if (!isEquipmentManager) {
+      setBorrowerId(borrowerResult.data || null);
+      if (!borrowerResult.data) borrowerMissing = true;
+    } else {
+      setBorrowerId(null);
+    }
+    if (borrowingResult.error) {
+      errors.push(["Borrowing records could not be loaded:", borrowingResult.error]);
+    } else {
+      const returnRequestsResult = await client.from("return_requests").select("borrowing_id, status");
+      if (returnRequestsResult.error) errors.push(["Return requests could not be loaded:", returnRequestsResult.error]);
+      const openReturnIds = new Set((returnRequestsResult.data || []).filter((item) => item.status === "pending").map((item) => item.borrowing_id));
+      setBorrowings((borrowingResult.data || []).map((item) => {
+        const borrower = item.borrowers;
+        const firstItem = item.borrowing_items?.[0];
+        const equipmentItem = firstItem?.equipment;
+        const equipmentNames = (item.borrowing_items || []).map((borrowingItem) => borrowingItem.equipment?.equipment_name).filter(Boolean);
+        const assetCodes = (item.borrowing_items || []).map((borrowingItem) => borrowingItem.equipment?.asset_code).filter(Boolean);
+        const isOverdue = (item.borrowing_items || []).some((borrowingItem) => borrowingItem.is_overdue);
+        const status = item.transaction_status === "released" && openReturnIds.has(item.borrowing_id)
+          ? "return_requested"
+          : isOverdue
+            ? "overdue"
+            : item.transaction_status;
+        return {
+          ...item,
+          id: item.borrowing_id,
+          borrower_name: [borrower?.first_name, borrower?.middle_name, borrower?.last_name].filter(Boolean).join(" ") || "Borrower",
+          borrower_email: borrower?.email || "",
+          purpose: item.purpose,
+          location_of_use: item.destination,
+          start_date: item.request_date,
+          expected_return: item.expected_return_date,
+          status,
+          is_overdue: isOverdue,
+          equipment_id: equipmentItem?.equipment_id,
+          equipment: equipmentItem ? {
+            id: equipmentItem.equipment_id,
+            name: equipmentNames.join(", "),
+            asset_tag: assetCodes.join(", "),
+            category: equipmentItem.categories?.category_name || "General",
+          } : null,
+          equipment_items: (item.borrowing_items || []).map((borrowingItem) => borrowingItem.equipment?.equipment_name).filter(Boolean),
+          quantity: (item.borrowing_items || []).reduce((total, borrowingItem) => total + Number(borrowingItem.quantity || 1), 0),
+          unit_items: (item.borrowing_items || [])
+            .filter((borrowingItem) => borrowingItem.equipment?.tracking_mode === "unit")
+            .map((borrowingItem) => ({
+              borrowing_item_id: borrowingItem.borrowing_item_id,
+              equipment_id: borrowingItem.equipment_id,
+              item_status: borrowingItem.item_status,
+              quantity: borrowingItem.quantity,
+            })),
+          quantity_items: (item.borrowing_items || [])
+            .filter((borrowingItem) => borrowingItem.equipment?.tracking_mode !== "unit")
+            .map((borrowingItem) => ({
+              borrowing_item_id: borrowingItem.borrowing_item_id,
+              equipment_id: borrowingItem.equipment_id,
+              equipment_name: borrowingItem.equipment?.equipment_name || "Equipment",
+              quantity: borrowingItem.quantity,
+            })),
+        };
+      }));
+    }
+    if (reservationResult.error) errors.push(["Reservations could not be loaded:", reservationResult.error]);
+    else setReservations((reservationResult.data || []).map((item) => ({
+      ...item,
+      id: item.reservation_id,
+      requester_id: item.requested_by,
+      requester_name: [item.borrowers?.first_name, item.borrowers?.middle_name, item.borrowers?.last_name].filter(Boolean).join(" "),
+      requester_email: item.borrowers?.email || "",
+      start_date: item.start_date,
+      end_date: item.end_date,
+      location_of_use: item.destination,
+      equipment: item.equipment ? {
+        id: item.equipment.equipment_id,
+        asset_tag: item.equipment.asset_code,
+        name: item.equipment.equipment_name,
+        category: item.equipment.categories?.category_name || "General",
+      } : null,
+      quantity: item.quantity || 1,
+    })));
+    if (feedbackResult.error) {
+      errors.push(["Feedback discussions could not be loaded:", feedbackResult.error]);
+    } else if (repliesResult.error) {
+      errors.push(["Feedback replies could not be loaded:", repliesResult.error]);
+    } else {
+      const repliesByThread = (repliesResult.data || []).reduce((all, reply) => {
+        all[reply.thread_id] = [...(all[reply.thread_id] || []), reply];
+        return all;
+      }, {});
+      setFeedbackThreads((feedbackResult.data || []).map((thread) => ({
+        ...thread,
+        replies: repliesByThread[thread.id] || [],
+      })));
+    }
+    if (isAdminUser) {
+      const memberResult = await client.from("profiles").select("*").order("full_name");
+      if (memberResult.error) errors.push(["Member management could not be loaded:", memberResult.error]);
+      else setMembers((memberResult.data || []).map((member) => ({
+        ...member,
+        display_name: member.display_name || member.full_name || "",
+        department: member.department || "",
+      })));
+    } else {
+      setMembers([]);
+    }
+    if (isEquipmentManager) {
+      const pendingAccountsResult = await client.from("profiles")
+        .select("id, full_name, email, created_at")
+        .eq("account_status", "pending")
+        .order("created_at", { ascending: true });
+      if (pendingAccountsResult.error) {
+        errors.push(["Pending accounts could not be loaded:", pendingAccountsResult.error]);
+      } else {
+        setPendingAccounts(pendingAccountsResult.data || []);
+      }
+    } else {
+      setPendingAccounts([]);
+    }
+    if (errors.length) {
+      errors.forEach(([context, loadError]) => console.error(context, loadError));
+      if (!borrowerMissing) setError("Some information could not be loaded. Please try again.");
+    }
+    if (borrowerMissing) setError(PENDING_BORROWER_MESSAGE);
+    setLoading(false);
+  }, [borrowingsPage, borrowingsSearch, category, categoryOptions, equipmentPageCursors, equipmentPageIndex, notificationSearch, notificationsPage, search]);
+
+  useEffect(() => {
+    if (!supabase) return undefined;
+    let alive = true;
+    supabase.auth.getSession().then(({ data, error: sessionError }) => {
+      if (!alive) return;
+      if (sessionError) setError(getErrorMessage(sessionError));
+      setUser(data.session?.user || null);
+      if (data.session?.user) loadData(supabase, data.session.user);
+      else setLoading(false);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "PASSWORD_RECOVERY") setRecoveryMode(true);
+      setUser(session?.user || null);
+      if (session?.user) loadData(supabase, session.user);
+      else {
+        setProfile(null);
+        setEquipment([]);
+        setBorrowings([]);
+        setCurrentlyBorrowed([]);
+        setReservations([]);
+        setMembers([]);
+        setPendingAccounts([]);
+        setFeedbackThreads([]);
+        setNotifications([]);
+        setUnreadNotificationCount(0);
+        setActiveAgreement(null);
+        setAcceptedAgreementVersion(null);
+        setLoading(false);
+      }
+    });
+    return () => {
+      alive = false;
+      subscription.unsubscribe();
+    };
+  }, [supabase, loadData]);
+
+  const isAdmin = profile?.role === "admin";
+  const isPropertyCustodian = profile?.role === "property_custodian";
+  const isEquipmentManager = isAdmin || isPropertyCustodian;
+  const isEquipmentStaff = isAdmin;
+  const isPendingBorrower = profile?.role === "staff" && profile.account_status === "pending";
+
+  useEffect(() => {
+    if (!supabase || profile?.account_status !== "active" || !["admin", "property_custodian"].includes(profile?.role)) {
+      setPendingRequestCount(0);
+      return undefined;
+    }
+
+    let active = true;
+    async function refreshPendingRequestCount() {
+      try {
+        const [borrowingCount, reservationCount] = await Promise.all([
+          supabase.from("borrowings").select("borrowing_id", { count: "exact", head: true }).eq("transaction_status", "requested"),
+          supabase.from("reservations").select("reservation_id", { count: "exact", head: true }).eq("status", "pending"),
+        ]);
+        if (!active) return;
+        if (borrowingCount.error || reservationCount.error) {
+          if (borrowingCount.error) console.error("Pending borrowing request count could not be loaded:", borrowingCount.error);
+          if (reservationCount.error) console.error("Pending reservation request count could not be loaded:", reservationCount.error);
+          return;
+        }
+        setPendingRequestCount((borrowingCount.count || 0) + (reservationCount.count || 0));
+      } catch (countError) {
+        if (active) console.error("Pending request counts could not be loaded:", countError);
+      }
+    }
+
+    refreshPendingRequestCount();
+    const interval = window.setInterval(refreshPendingRequestCount, 60_000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [supabase, profile?.account_status, profile?.role]);
+
+  useEffect(() => {
+    if (!supabase || !user || !isPendingBorrower) return undefined;
+    let active = true;
+    async function refreshPendingAccountState() {
+      try {
+        const { data: accountState, error: stateError } = await supabase.rpc("get_my_account_state");
+        if (!active) return;
+        if (stateError) {
+          console.error("The pending borrower account state could not be refreshed:", stateError);
+          return;
+        }
+        if (["active", "inactive"].includes(accountState)) await loadData(supabase, user);
+      } catch (stateError) {
+        if (active) console.error("The pending borrower account state could not be refreshed:", stateError);
+      }
+    }
+    const interval = window.setInterval(refreshPendingAccountState, 60_000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [supabase, user, isPendingBorrower, loadData]);
+
+  useEffect(() => {
+    if (!profile) return;
+    const allowedViews = isAdmin
+      ? ["overview", "equipment", "currently-borrowed", "reports", "audit-log", "feedback", "requests", "pending-accounts", "members", "account"]
+      : isPropertyCustodian
+        ? ["overview", "equipment", "currently-borrowed", "reports", "requests", "pending-accounts", "feedback", "account"]
+        : ["equipment", "loans", "feedback", "account"];
+    if (!allowedViews.includes(view)) setView(isAdmin || isPropertyCustodian ? "overview" : "equipment");
+  }, [profile, isAdmin, isPropertyCustodian, view]);
+
+  useEffect(() => {
+    setSearchShortcut(/Mac|iPhone|iPad/i.test(navigator.platform) ? "⌘ K" : "Ctrl K");
+    function focusSearch(event) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    }
+    window.addEventListener("keydown", focusSearch);
+    return () => window.removeEventListener("keydown", focusSearch);
+  }, []);
+
+  const categories = useMemo(
+    () => ["All equipment", ...categoryOptions.map((item) => item.category_name)],
+    [categoryOptions],
+  );
+  const filteredEquipment = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return equipment.filter((item) => {
+      const matchesCategory = category === "All equipment" || item.category === category;
+      const matchesQuery = !query || [item.name, item.asset_tag, item.category, item.location, item.brand, item.model].some((field) => field?.toLowerCase().includes(query));
+      return matchesCategory && matchesQuery;
+    });
+  }, [equipment, category, search]);
+
+  function resetEquipmentPagination() {
+    setEquipmentPageCursors([null]);
+    setEquipmentPageIndex(0);
+  }
+
+  function nextEquipmentPage() {
+    if (equipment.length < 20) return;
+    const lastItem = equipment[equipment.length - 1];
+    setEquipmentPageCursors((cursors) => [...cursors.slice(0, equipmentPageIndex + 1), {
+      equipment_id: lastItem.equipment_id,
+      equipment_name: lastItem.equipment_name,
+    }]);
+    setEquipmentPageIndex((index) => index + 1);
+  }
+
+  const counts = useMemo(() => {
+    return {
+      available: equipment.filter((item) => item.status === "available").length,
+    };
+  }, [equipment]);
+
+  async function refresh() {
+    if (supabase && user) await loadData(supabase, user);
+  }
+
+  async function runAction(action, successMessage) {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await action();
+      if (result?.error) throw result.error;
+      setNotice(result?.notice || successMessage);
+      setModal(null);
+      await refresh();
+      return true;
+    } catch (actionError) {
+      const message = getErrorMessage(actionError);
+      if (message === PENDING_BORROWER_MESSAGE) setNotice(message);
+      else setError(message);
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function anonymizeMember(member) {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      if (member.profile_photo_path) {
+        const { error: storageError } = await supabase.storage.from("profile-photos").remove([member.profile_photo_path]);
+        if (storageError) {
+          console.error("The profile photo could not be deleted:", storageError);
+          throw new Error("The profile photo could not be deleted; borrower details were not changed.");
+        }
+      }
+      const { error: anonymizeError } = await supabase.rpc("admin_anonymize_inactive_borrower", { p_user_id: member.id });
+      if (anonymizeError) throw anonymizeError;
+      await refresh();
+      setNotice("Borrower details anonymized.");
+      return true;
+    } catch (actionError) {
+      setError(getErrorMessage(actionError));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitRequest(event) {
+    event.preventDefault();
+    if (!modal || !supabase || !user) return;
+    if (isPendingBorrower) {
+      setModal(null);
+      setNotice(PENDING_BORROWER_MESSAGE);
+      return;
+    }
+    const form = new FormData(event.currentTarget);
+    const requiresAgreement = profile?.role === "staff"
+      && activeAgreement
+      && Number(acceptedAgreementVersion) !== Number(activeAgreement.version_id);
+    if (requiresAgreement && !form.get("accept_agreement")) {
+      setError("Read and accept the current borrower agreement before submitting a request.");
+      return;
+    }
+    if (profile?.role === "staff" && !activeAgreement) {
+      setError("The current borrower agreement could not be loaded. Please contact an administrator.");
+      return;
+    }
+    const purposeChoice = String(form.get("purpose") || "").trim();
+    const otherPurpose = String(form.get("purpose_other") || "").trim();
+    const purpose = purposeChoice === "Other" ? otherPurpose : purposeChoice;
+    if (!purpose || purpose.length > 300) {
+      setError("Enter a purpose of 300 characters or fewer.");
+      return;
+    }
+    const common = {
+      p_equipment_id: modal.item.id,
+      p_purpose: purpose,
+      p_destination: String(form.get("use_location") || "").trim(),
+      p_quantity: Number(form.get("amount")),
+    };
+    const submitWithAgreement = async (request) => {
+      if (requiresAgreement) {
+        const acceptanceResult = await supabase.rpc("accept_borrower_agreement", {
+          p_version_id: activeAgreement.version_id,
+        });
+        if (acceptanceResult.error) throw acceptanceResult.error;
+      }
+      return request();
+    };
+    if (modal.kind === "reservation") {
+      await runAction(() => submitWithAgreement(() => supabase.rpc("request_equipment_reservation", {
+        ...common,
+        p_start_date: form.get("start_date"),
+        p_end_date: form.get("end_date"),
+        p_start_time: form.get("start_time"),
+        p_end_time: form.get("end_time"),
+      })), "Reservation request submitted.");
+    } else {
+      const returnAt = new Date(`${form.get("end_date")}T${form.get("end_time")}`);
+      if (Number.isNaN(returnAt.getTime())) {
+        setError("Choose a valid expected return date and time.");
+        return;
+      }
+      await runAction(() => submitWithAgreement(() => supabase.rpc("request_equipment_borrowing", {
+        ...common,
+        p_expected_return_date: returnAt.toISOString(),
+      })), "Borrowing request submitted.");
+    }
+  }
+
+  async function publishAgreement(event) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    const title = String(form.get("agreement_title") || "").trim();
+    const bodyText = String(form.get("agreement_body") || "").trim();
+    const published = await runAction(
+      () => supabase.rpc("publish_borrower_agreement", { p_title: title, p_body_text: bodyText }),
+      "A new borrower agreement version was published.",
+    );
+    if (published) formElement.reset();
+  }
+
+  async function markNotificationRead(notificationId) {
+    await runAction(
+      () => supabase.rpc("mark_notification_read", { p_notification_id: notificationId }),
+      "Notification marked as read.",
+    );
+  }
+
+  async function markAllNotificationsRead() {
+    await runAction(
+      () => supabase.rpc("mark_all_notifications_read"),
+      "All notifications marked as read.",
+    );
+  }
+
+  async function uploadEquipmentImage(form) {
+    const file = form.get("image");
+    const encodedImage = await encodeImageToWebp(file, "equipment", 4096);
+    if (!encodedImage) return null;
+
+    const path = `${user.id}/${crypto.randomUUID()}.webp`;
+    const { error: uploadError } = await supabase.storage
+      .from("equipment-images")
+      .upload(path, new File([encodedImage], "equipment.webp", { type: "image/webp" }), {
+        contentType: "image/webp",
+        cacheControl: "3600",
+      });
+    if (uploadError) throw uploadError;
+    return supabase.storage.from("equipment-images").getPublicUrl(path).data.publicUrl;
+  }
+
+  async function uploadProfilePhoto(file) {
+    const encodedImage = await encodeImageToWebp(file, "profile photo", 1024);
+    if (!encodedImage) return null;
+    const path = `${user.id}/${crypto.randomUUID()}.webp`;
+    const { error: uploadError } = await supabase.storage
+      .from("profile-photos")
+      .upload(path, new File([encodedImage], "profile.webp", { type: "image/webp" }), {
+        contentType: "image/webp",
+        cacheControl: "3600",
+      });
+    if (uploadError) throw uploadError;
+    return path;
+  }
+
+  async function addEquipment(event) {
+    event.preventDefault();
+    if (!isEquipmentManager || !supabase || !user) return;
+    const form = new FormData(event.currentTarget);
+    const item = {
+      asset_code: String(form.get("asset_tag") || "").trim(),
+      equipment_name: String(form.get("name") || "").trim(),
+      category_id: Number(form.get("category_id")),
+      quantity: Number(form.get("quantity")),
+      brand: String(form.get("brand") || "").trim() || null,
+      model: String(form.get("model") || "").trim() || null,
+      serial_number: String(form.get("serial_number") || "").trim() || null,
+      storage_location: String(form.get("location") || "").trim(),
+      description: String(form.get("description") || "").trim(),
+      availability_status: "available",
+      condition_status: "good",
+    };
+    await runAction(async () => {
+      const imageUrl = await uploadEquipmentImage(form);
+      const { error: insertError } = await supabase.from("equipment").insert({ ...item, image_url: imageUrl });
+      if (insertError) throw insertError;
+    }, "Equipment added to inventory.");
+  }
+
+  async function updateEquipment(event) {
+    event.preventDefault();
+    if (!isEquipmentManager || !modal?.item || !supabase || !user) return;
+    const form = new FormData(event.currentTarget);
+    const item = {
+      asset_code: String(form.get("asset_tag") || "").trim(),
+      equipment_name: String(form.get("name") || "").trim(),
+      category_id: Number(form.get("category_id")),
+      quantity: Number(form.get("quantity")),
+      brand: String(form.get("brand") || "").trim() || null,
+      model: String(form.get("model") || "").trim() || null,
+      serial_number: String(form.get("serial_number") || "").trim() || null,
+      storage_location: String(form.get("location") || "").trim(),
+      description: String(form.get("description") || "").trim(),
+      availability_status: String(form.get("status") || "available"),
+      condition_status: String(form.get("condition_status") || "good"),
+      updated_at: new Date().toISOString(),
+    };
+    await runAction(async () => {
+      const imageUrl = await uploadEquipmentImage(form);
+      if (imageUrl) item.image_url = imageUrl;
+      else if (form.get("remove_image") === "on") item.image_url = null;
+      const { error: updateError } = await supabase.from("equipment").update(item).eq("equipment_id", modal.item.id);
+      if (updateError) throw updateError;
+    }, "Equipment record updated.");
+  }
+
+  async function saveAccount(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const firstName = String(form.get("first_name") || "").trim();
+    const lastName = String(form.get("last_name") || "").trim();
+    const selectedPhoto = form.get("profile_photo");
+    const removePhoto = form.get("remove_profile_photo") === "on";
+    await runAction(async () => {
+      const { error: profileError } = await supabase.rpc("update_my_account_profile", {
+        p_first_name: firstName,
+        p_last_name: lastName,
+        p_department: String(form.get("department") || "").trim(),
+        p_course: String(form.get("course") || "").trim(),
+        p_gender: String(form.get("gender") || "").trim(),
+      });
+      if (profileError) throw profileError;
+
+      const uploadedPath = selectedPhoto instanceof File && selectedPhoto.size
+        ? await uploadProfilePhoto(selectedPhoto)
+        : null;
+      if (uploadedPath || (removePhoto && profile.profile_photo_path)) {
+        const newPhotoPath = uploadedPath || null;
+        const { error: photoError } = await supabase.rpc("update_my_profile_photo", {
+          p_profile_photo_path: newPhotoPath,
+        });
+        if (photoError) {
+          if (uploadedPath) {
+            const { error: cleanupError } = await supabase.storage.from("profile-photos").remove([uploadedPath]);
+            if (cleanupError) {
+              console.error("The uploaded profile photo could not be cleaned up:", cleanupError);
+              throw new Error("The profile photo update failed and the uploaded image could not be cleaned up.");
+            }
+          }
+          throw photoError;
+        }
+        if (profile.profile_photo_path && profile.profile_photo_path !== newPhotoPath) {
+          const { error: cleanupError } = await supabase.storage.from("profile-photos").remove([profile.profile_photo_path]);
+          if (cleanupError) {
+            console.error("The previous profile photo could not be removed:", cleanupError);
+            throw new Error("Your profile was updated, but the previous photo could not be removed.");
+          }
+        }
+      }
+    }, "Account settings saved.");
+  }
+
+  async function submitFeedback(event) {
+    event.preventDefault();
+    const feedbackForm = event.currentTarget;
+    const form = new FormData(feedbackForm);
+    const thread = {
+      author_id: user.id,
+      author_name: displayName,
+      title: String(form.get("title") || "").trim(),
+      category: String(form.get("category") || "suggestion"),
+      message: String(form.get("message") || "").trim(),
+    };
+    const posted = await runAction(
+      () => supabase.from("feedback_threads").insert(thread),
+      "Feedback posted to the discussion board.",
+    );
+    if (posted) feedbackForm.reset();
+  }
+
+  async function replyToFeedback(event, threadId) {
+    event.preventDefault();
+    const replyForm = event.currentTarget;
+    const form = new FormData(replyForm);
+    const message = String(form.get("reply") || "").trim();
+    if (!message) return;
+    const posted = await runAction(
+      () => supabase.from("feedback_replies").insert({
+        thread_id: threadId,
+        author_id: user.id,
+        author_name: displayName,
+        message,
+      }),
+      "Reply posted.",
+    );
+    if (posted) replyForm.reset();
+  }
+
+  async function signOut() {
+    const { error: signOutError } = await supabase.auth.signOut();
+    if (signOutError) setError(getErrorMessage(signOutError));
+    else setProfileMenuOpen(false);
+  }
+
+  if (!user) return <SignIn supabase={supabase} configError={configError} />;
+  if (!user.email_confirmed_at) {
+    return (
+      <main className="profile-guard" role="alert">
+        <div><span className="brand-mark"><ShieldCheck size={21} /></span><h1>Email verification required</h1>
+          <p>Confirm your email address before accessing this workspace. Check the Supabase Auth email-confirmation settings.</p>
+          <button className="button-secondary" type="button" onClick={signOut}>Sign out</button>
+        </div>
+      </main>
+    );
+  }
+  if (!profile) {
+    return (
+      <main className="profile-guard" role={error ? "alert" : "status"}>
+        <div><span className="brand-mark"><ShieldCheck size={21} /></span><h1>{error ? "Workspace access unavailable" : "Verifying your access…"}</h1>
+          <p>{error || "Your account permissions are being checked securely."}</p>
+          {error ? <button className="button-secondary" type="button" onClick={signOut}>Sign out</button> : <LoadingPanel />}
+        </div>
+      </main>
+    );
+  }
+  if (profile.account_status !== "active" && !isPendingBorrower) {
+    const isPending = profile.account_status === "pending";
+    const isDeactivated = profile.account_status === "inactive";
+    return (
+      <main className="profile-guard" role="status">
+        <div>
+          <span className="brand-mark"><ShieldCheck size={21} /></span>
+          <h1>{isPending ? "Account pending approval" : isDeactivated ? "This account has been deactivated" : "Workspace access unavailable"}</h1>
+          <p>{isPending
+            ? "Your account is awaiting approval from an administrator or property custodian. You cannot submit borrowing or reservation requests until it is approved."
+            : isDeactivated
+              ? "Contact an administrator if you believe this is a mistake."
+              : "This account is not active. Contact an administrator or property custodian if you believe this is a mistake."}</p>
+          {error && <p className="feedback feedback-error" role="alert">{error}</p>}
+          {notifications.length > 0 && <section className="guard-notifications" aria-label="Account notifications">
+            <div className="notification-panel-heading">
+              <div><strong>Notifications</strong><small>{unreadNotificationCount} unread</small></div>
+              <button type="button" onClick={markAllNotificationsRead} disabled={!unreadNotificationCount || busy}>Mark all read</button>
+            </div>
+            <ul>{notifications.map((item) => <li className={item.is_read ? "" : "notification-unread"} key={item.notification_id}>
+              <div><strong>{item.title}</strong><p>{item.message}</p><time dateTime={item.created_at}>{dateTimeLabel(item.created_at)}</time></div>
+              {!item.is_read && <button type="button" onClick={() => markNotificationRead(item.notification_id)} disabled={busy}>Mark read</button>}
+            </li>)}</ul>
+          </section>}
+          <button className="button-secondary" type="button" onClick={signOut}>Sign out</button>
+        </div>
+      </main>
+    );
+  }
+
+  const displayName = profile?.display_name || user.user_metadata?.display_name || user.email?.split("@")[0] || "Member";
+  const userRole = profile?.role || "unavailable";
+
+  const sectionHeader = {
+    overview: ["Good day", displayName, "Here’s what’s happening with your team’s equipment."],
+    equipment: ["Equipment library", "Find the right gear", "Browse available equipment or check when an item is due back."],
+    loans: ["Your activity", "My equipment", "Track borrowing requests, reservations, due dates, and returns."],
+    reports: ["At a glance", "Reports", "Recent database-recorded equipment changes."],
+    "currently-borrowed": ["Equipment use", "Equipment tracking", "Current borrowed and reserved equipment, including overdue loans."],
+    requests: ["Operations", isPropertyCustodian ? "Borrower requests" : "Manage requests", "Find requests by the borrower's first or last name."],
+    "pending-accounts": ["Operations", "Pending accounts", "Approve or reject new borrower access requests."],
+    members: ["Operations", "Members & roles", "Review account access and keep member permissions up to date."],
+    feedback: ["Have a say", "Feedback & ideas", "Share improvements and discuss how the system should grow."],
+    account: ["Your profile", "Account settings", "Keep your name and department information up to date."],
+  }[view] || ["Workspace", "Equipment", "Manage equipment and requests."];
+
+  const myBorrowings = borrowings.filter((item) => Number(item.borrower_id) === Number(borrowerId));
+  const myReservations = reservations.filter((item) => item.requester_id === user.id);
+  const visibleNavItems = isAdmin
+    ? ADMIN_NAV_ITEMS
+    : isPropertyCustodian
+      ? CUSTODIAN_NAV_ITEMS
+      : MEMBER_NAV_ITEMS;
+
+  return (
+    <div className="app-shell">
+      {mobileNav && <button className="backdrop" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
+      <aside className={`sidebar ${mobileNav ? "sidebar-open" : ""}`}>
+        <Link className="brand" href="/" aria-label="RMMC-MI home">
+          <span className="brand-mark"><HardDrive size={21} /></span>
+          <span>RMMC <i>·</i> MI</span>
+        </Link>
+        <div className="workspace-label">EQUIPMENT SERVICES</div>
+        <nav className="main-nav" aria-label="Main navigation">
+          <p className="nav-label">Workspace</p>
+          {visibleNavItems.map(({ id, label, icon: Icon }) => (
+            <button key={id} className={`nav-item ${view === id ? "active" : ""}`} onClick={() => { setView(id); setMobileNav(false); }}>
+              <Icon size={18} /><span>{label}</span>
+              {id === "loans" && myBorrowings.some((item) => item.status === "requested") && <i className="nav-badge">!</i>}
+              {id === "pending-accounts" && pendingAccounts.length > 0 && <i className="nav-badge">{pendingAccounts.length}</i>}
+              {id === "requests" && pendingRequestCount > 0 && <i className="nav-badge">{pendingRequestCount > 99 ? "99+" : pendingRequestCount}</i>}
+            </button>
+          ))}
+          {isAdmin && (
+            <>
+              <p className="nav-label nav-section">Administration</p>
+              {ADMIN_ITEMS.map(({ id, label, icon: Icon }) => (
+                <button key={id} className={`nav-item ${view === id ? "active" : ""}`} onClick={() => { setView(id); setMobileNav(false); }}>
+                  <Icon size={18} /><span>{label}</span>
+                  {id === "requests" && pendingRequestCount > 0 && <i className="nav-badge">{pendingRequestCount > 99 ? "99+" : pendingRequestCount}</i>}
+                  {id === "pending-accounts" && pendingAccounts.length > 0 && <i className="nav-badge">{pendingAccounts.length}</i>}
+                </button>
+              ))}
+            </>
+          )}
+        </nav>
+        <div className="sidebar-spacer" />
+        <div className="help-card">
+          <span className="help-icon"><MessageSquare size={15} /></span>
+          <strong>Help shape the system</strong>
+          <p>Share ideas, report an issue, or discuss what should come next.</p>
+          <button type="button" onClick={() => setView("feedback")}>Open feedback <ArrowUpRight size={14} /></button>
+        </div>
+        <div className="sidebar-user">
+          <ProfileAvatar name={displayName} photoUrl={profile.profile_photo_url} />
+          <div><strong>{displayName}</strong><span>{userRole === "admin" ? "Administrator" : userRole === "property_custodian" ? "Property custodian" : userRole === "staff" ? "Borrower" : "Role unavailable"}</span></div>
+        </div>
+      </aside>
+
+      <main className="content">
+        <header className="topbar">
+          <button className="menu-button" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={20} /></button>
+          <span className="topbar-context">RMMC-MI <i>/</i> Equipment services</span>
+          <div className="top-actions">
+            <InstallAppButton />
+            <div className="notification-wrap">
+              <button
+                className="notification-trigger"
+                type="button"
+                aria-label={`Notifications${unreadNotificationCount ? `, ${unreadNotificationCount} unread` : ""}`}
+                aria-expanded={notificationOpen}
+                onClick={() => setNotificationOpen((open) => !open)}
+              >
+                <Bell size={18} aria-hidden="true" />
+                {unreadNotificationCount > 0 && <span className="notification-count">{unreadNotificationCount > 99 ? "99+" : unreadNotificationCount}</span>}
+              </button>
+              {notificationOpen && (
+                <section className="notification-panel" aria-label="Notifications">
+                  <div className="notification-panel-heading">
+                    <div><strong>Notifications</strong><small>{unreadNotificationCount} unread</small></div>
+                    <button type="button" onClick={markAllNotificationsRead} disabled={!unreadNotificationCount || busy}>Mark all read</button>
+                  </div>
+                  <label className="notification-search"><Search size={14} /><input value={notificationSearch} onChange={(event) => { setNotificationSearch(event.target.value); setNotificationsPage(0); }} placeholder="Search notifications" aria-label="Search notifications" /></label>
+                  {!notifications.length ? <p className="notification-empty">You’re all caught up.</p> : (
+                    <ul>
+                      {notifications.map((item) => (
+                        <li className={item.is_read ? "" : "notification-unread"} key={item.notification_id}>
+                          <div><strong>{item.title}</strong><p>{item.message}</p><time dateTime={item.created_at}>{dateTimeLabel(item.created_at)}</time></div>
+                          {!item.is_read && <button type="button" onClick={() => markNotificationRead(item.notification_id)} disabled={busy}>Mark read</button>}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <div className="notification-pagination">
+                    <button type="button" onClick={() => setNotificationsPage((page) => Math.max(0, page - 1))} disabled={notificationsPage === 0}>Previous</button>
+                    <span>Page {notificationsPage + 1}</span>
+                    <button type="button" onClick={() => setNotificationsPage((page) => page + 1)} disabled={notifications.length < 20}>Next</button>
+                  </div>
+                </section>
+              )}
+            </div>
+            <div className="profile-menu-wrap">
+              <button className="user-chip profile-menu-trigger" type="button" title={`${displayName} · ${userRole}`} aria-label="Open user account menu" aria-expanded={profileMenuOpen} onClick={() => setProfileMenuOpen((open) => !open)}>
+                <ProfileAvatar name={displayName} photoUrl={profile.profile_photo_url} />
+                <div><strong>{displayName}</strong><span>{userRole === "admin" ? "Administrator" : userRole === "property_custodian" ? "Property custodian" : "Borrower account"}</span></div>
+                <Settings size={15} aria-hidden="true" />
+              </button>
+              {profileMenuOpen && <div className="profile-menu" role="menu">
+                <button type="button" role="menuitem" onClick={() => { setView("account"); setProfileMenuOpen(false); }}><Settings size={15} /> Account settings</button>
+                <button type="button" role="menuitem" onClick={signOut}><LogOut size={15} /> Log out</button>
+              </div>}
+            </div>
+          </div>
+        </header>
+
+        <div className="page">
+          <section className="page-heading">
+            <div>
+              <p className="eyebrow">{sectionHeader[0]}</p>
+              <h1>{sectionHeader[1]}{view === "overview" && <span className="heading-period">.</span>}</h1>
+              <p>{sectionHeader[2]}</p>
+            </div>
+            {view === "equipment" && !isPendingBorrower && <div className="availability-note"><span /> <strong>{counts.available}</strong> items available</div>}
+            {view === "equipment" && isEquipmentManager && <button className="button-primary" onClick={() => setModal({ kind: "add-equipment" })}><Plus size={17} /> Add equipment</button>}
+          </section>
+
+          {isPendingBorrower && ["equipment", "loans"].includes(view) && (
+            <div className="pending-borrower-notice" role="status">{PENDING_BORROWER_MESSAGE}</div>
+          )}
+
+          {(error || notice) && (
+            <div className={`banner ${error ? "banner-error" : "banner-success"}`} role={error ? "alert" : "status"}>
+              <span>{error ? error : notice}</span>
+              {error && <button onClick={() => setError("")} aria-label="Dismiss error"><X size={16} /></button>}
+            </div>
+          )}
+
+          {view === "overview" && (
+            <>
+              <section className="welcome-strip">
+                <div className="welcome-icon"><ShieldCheck size={21} /></div>
+                <div><strong>{isEquipmentManager ? "Your equipment operations workspace" : "Your equipment workspace"}</strong><p>{isEquipmentManager ? "Keep the equipment library accurate and coordinate borrower requests." : "Browse gear, check your requests, and keep every return on schedule."}</p></div>
+                <button onClick={() => setView(isEquipmentManager ? "requests" : "equipment")}>{isEquipmentManager ? "Review requests" : "Browse equipment"} <ArrowUpRight size={15} /></button>
+                <div className="welcome-decoration" />
+              </section>
+              <OverviewStatistics
+                supabase={supabase}
+                isManager={isEquipmentManager}
+                borrowerId={borrowerId}
+                pendingRequestCount={pendingRequestCount}
+                loading={loading}
+              />
+              {isEquipmentManager ? (
+                <>
+                  <OverviewReportCards
+                    supabase={supabase}
+                    onSelectReport={(reportId) => { setSelectedReport(reportId); setView("reports"); }}
+                  />
+                </>
+              ) : (
+                <>
+                  <div className="section-title"><div><h2>Find equipment</h2><p>Browse what’s available for your next project</p></div><button className="text-action" onClick={() => setView("equipment")}>Explore library <ArrowUpRight size={15} /></button></div>
+                  <div className="equipment-grid compact-grid">
+                    {(equipment.filter((item) => item.status === "available").slice(0, 3)).map((item) => <EquipmentCard key={item.id} item={item} canRequest={false} onBorrow={(selected) => setModal({ kind: "borrow", item: selected })} onReserve={(selected) => setModal({ kind: "reservation", item: selected })} />)}
+                    {!loading && equipment.length === 0 && <EmptyState title="Your equipment library is ready" copy="Once equipment is added to the inventory, it will appear here." action={isAdmin ? "Add equipment" : null} onAction={() => setModal({ kind: "add-equipment" })} />}
+                  </div>
+                </>
+              )}
+            </>
+          )}
+
+          {view === "equipment" && !isPendingBorrower && (
+            <>
+              <div className="toolbar">
+                <label className="search-box"><Search size={18} /><input ref={searchInputRef} value={search} onChange={(event) => { setSearch(event.target.value); resetEquipmentPagination(); }} placeholder="Search equipment, tag or location" aria-label="Search equipment" /><kbd>{searchShortcut}</kbd></label>
+                <div className="category-tabs" role="group" aria-label="Filter by category">
+                  {categories.map((item) => <button key={item} className={category === item ? "selected" : ""} onClick={() => { setCategory(item); resetEquipmentPagination(); }}>{item}</button>)}
+                </div>
+                <span className="filter-caption"><Filter size={15} /> {equipmentTotalCount} results</span>
+              </div>
+              {loading ? <LoadingPanel /> : filteredEquipment.length ? (
+                <div className="equipment-grid">
+                  {filteredEquipment.map((item) => <EquipmentCard key={item.id} item={item} canRequest={!isEquipmentManager} onBorrow={(selected) => setModal({ kind: "borrow", item: selected })} onReserve={(selected) => setModal({ kind: "reservation", item: selected })} />)}
+                </div>
+              ) : <EmptyState title={equipment.length ? "No matching equipment" : "No equipment has been added yet"} copy={equipment.length ? "Try another search or category." : "The inventory team can add equipment to make it available here."} action={isEquipmentManager && !equipment.length ? "Add equipment" : null} onAction={() => setModal({ kind: "add-equipment" })} />}
+              <nav className="unit-pagination" aria-label="Equipment pages"><span>Page {equipmentPageIndex + 1} · {equipment.length} of {equipmentTotalCount} items</span><div><button className="button-secondary" type="button" onClick={() => setEquipmentPageIndex((index) => Math.max(0, index - 1))} disabled={equipmentPageIndex === 0}><ArrowLeft size={14} /> Previous</button><button className="button-secondary" type="button" onClick={nextEquipmentPage} disabled={equipment.length < 20}>Next <ArrowRight size={14} /></button></div></nav>
+              {isEquipmentManager && (
+                <>
+                  <div className="section-title"><div><h2>Manage equipment</h2><p>Edit item details or remove retired equipment from the active library.</p></div><span className="record-count">{equipmentTotalCount} active items</span></div>
+                  <div className="unit-management-link"><Link className="button-secondary" href="/equipment-units">Manage units, maintenance, and labels <ArrowUpRight size={15} /></Link></div>
+                  <EquipmentTable
+                    equipment={equipment}
+                    onEdit={(item) => setModal({ kind: "edit-equipment", item })}
+                    onDelete={(item) => {
+                      if (window.confirm(`Remove ${item.name} (${item.asset_tag}) from the active equipment library? Existing borrowing history will be preserved.`)) {
+                        runAction(() => supabase.rpc("delete_equipment", { p_equipment_id: item.id }), "Equipment removed from the active library.");
+                      }
+                    }}
+                  />
+                </>
+              )}
+            </>
+          )}
+
+          {view === "currently-borrowed" && isEquipmentManager && (
+            <CurrentlyBorrowedWorkspace rows={currentlyBorrowed} categories={categoryOptions} loading={loading} />
+          )}
+
+          {view === "loans" && !isEquipmentManager && !isPendingBorrower && (
+            <>
+              <div className="toolbar list-toolbar">
+                <div className="list-toolbar-copy"><span className="toolbar-icon"><ClipboardList size={17} /></span><div><strong>My equipment</strong><small>Borrowing requests and reservations tied to your account</small></div></div>
+                <span className="record-count">{myBorrowings.length + myReservations.length} records</span>
+              </div>
+              <BorrowingList
+                rows={myBorrowings}
+                page={borrowingsPage}
+                hasMore={borrowings.length === 20}
+                onPageChange={setBorrowingsPage}
+                onRequestReturn={(row) => runAction(() => supabase.rpc("request_equipment_return", { p_borrowing_id: row.id }), "Return request submitted.")}
+                onCancelRequest={(row) => runAction(() => supabase.rpc("cancel_my_pending_borrowing", { p_borrowing_id: row.id }), "Borrowing request cancelled.")}
+                loading={loading}
+              />
+              {currentUnitTags.length > 0 && <section className="borrower-unit-tags"><div className="section-title"><div><h2>Unit tags currently assigned to you</h2><p>Only the asset tags of your held units are shown here.</p></div></div><ul>{currentUnitTags.map((unit, index) => <li key={`${unit.asset_tag}-${index}`}>{unit.asset_tag}</li>)}</ul></section>}
+              <div className="section-title"><div><h2>My reservations</h2><p>Upcoming and past reservation requests</p></div><span className="record-count">{myReservations.length} records</span></div>
+              <ReservationList
+                rows={myReservations}
+                loading={loading}
+                onCancel={(row) => runAction(() => supabase.rpc("cancel_my_pending_reservation", { p_reservation_id: row.id }), "Reservation cancelled.")}
+              />
+            </>
+          )}
+
+          {view === "requests" && (isEquipmentStaff || isPropertyCustodian) && (
+            <AdminRequests
+              borrowings={borrowings}
+              reservations={reservations}
+              search={borrowingsSearch}
+              onSearchChange={(value) => { setBorrowingsSearch(value); setBorrowingsPage(0); }}
+              page={borrowingsPage}
+              hasMore={borrowings.length === 20}
+              onPageChange={setBorrowingsPage}
+              busy={busy}
+              runAction={runAction}
+              supabase={supabase}
+              canReview={isAdmin || isPropertyCustodian}
+              userId={user.id}
+              refreshEquipment={refresh}
+            />
+          )}
+
+          {view === "pending-accounts" && isEquipmentManager && (
+            <PendingAccounts
+              accounts={pendingAccounts}
+              busy={busy}
+              runAction={runAction}
+              supabase={supabase}
+            />
+          )}
+
+          {view === "members" && isEquipmentStaff && (
+            <>
+              <div className="toolbar list-toolbar">
+                <div className="list-toolbar-copy"><span className="toolbar-icon"><UsersRound size={17} /></span><div><strong>Workspace members</strong><small>Manage access to equipment operations</small></div></div>
+                <span className="record-count">{members.length} accounts</span>
+              </div>
+              <MemberTable members={members} currentUserId={user.id} busy={busy} runAction={runAction} onAnonymize={anonymizeMember} supabase={supabase} />
+              <section className="agreement-publisher">
+                <div className="section-title"><div><h2>Borrower agreement</h2><p>Publishing a new version requires borrowers to accept it before their next request.</p></div>
+                  {activeAgreement && <span className="record-count">Current version {activeAgreement.version_number}</span>}
+                </div>
+                <form className="modal-form agreement-publisher-form" onSubmit={publishAgreement}>
+                  <label><span>New agreement title</span><input name="agreement_title" maxLength={200} required /></label>
+                  <label><span>Agreement text</span><textarea name="agreement_body" rows="8" maxLength={20000} required /></label>
+                  <button className="button-primary" type="submit" disabled={busy}>Publish new version <Check size={15} /></button>
+                </form>
+              </section>
+            </>
+          )}
+
+          {view === "reports" && isEquipmentManager && <ReportsWorkspace supabase={supabase} initialReportId={selectedReport} />}
+
+          {view === "audit-log" && isAdmin && <AuditLogWorkspace supabase={supabase} isAdmin={isAdmin} />}
+
+          {view === "feedback" && (
+            <FeedbackBoard
+              threads={feedbackThreads}
+              currentUserId={user.id}
+              isAdmin={isAdmin}
+              canManageFeedback={isEquipmentManager}
+              busy={busy}
+              onCreate={submitFeedback}
+              onReply={replyToFeedback}
+              onDeleteReply={(reply) => {
+                if (window.confirm(`Permanently delete the comment from ${reply.author_name}?`)) {
+                  runAction(
+                    () => supabase.from("feedback_replies").delete().eq("id", reply.id),
+                    "Comment deleted.",
+                  );
+                }
+              }}
+              onDeleteThread={(thread) => {
+                if (window.confirm(`Permanently delete "${thread.title}" and all of its replies?`)) {
+                  runAction(
+                    () => supabase.from("feedback_threads").delete().eq("id", thread.id).select("id").single(),
+                    "Feedback thread and its replies deleted.",
+                  );
+                }
+              }}
+              onStatusChange={(threadId, status) => runAction(
+                () => supabase.from("feedback_threads").update({ status }).eq("id", threadId),
+                "Feedback status updated.",
+              )}
+            />
+          )}
+
+          {view === "account" && (
+            <AccountSettings profile={profile} user={user} busy={busy} onSave={saveAccount} />
+          )}
+
+          <footer className="page-footer"><span>RMMC-MI Equipment Services</span><span>Keep equipment safe. Keep projects moving.</span></footer>
+        </div>
+      </main>
+
+      {modal && !isPendingBorrower && (
+        <div className="modal-wrap" role="presentation">
+          <button className="modal-backdrop" onClick={() => !busy && setModal(null)} aria-label="Close dialog" />
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+            <button className="modal-close" onClick={() => setModal(null)} aria-label="Close" disabled={busy}><X size={18} /></button>
+            {modal.kind === "add-equipment" || modal.kind === "edit-equipment" ? (
+              <>
+                <div className="modal-kicker">INVENTORY</div>
+                <h2 id="modal-title">{modal.kind === "edit-equipment" ? "Edit equipment" : "Add equipment"}</h2>
+                <p className="modal-copy">{modal.kind === "edit-equipment" ? "Update this record. Changes are saved to the database audit history." : "Create an equipment record for your team to discover and request."}</p>
+                <form className="modal-form" onSubmit={modal.kind === "edit-equipment" ? updateEquipment : addEquipment}>
+                  <label><span>Equipment name</span><input name="name" placeholder="e.g. Canon EOS R6" defaultValue={modal.item?.name || ""} required maxLength={160} /></label>
+                  <div className="form-row"><label><span>Asset code</span><input name="asset_tag" placeholder="CAM-001" defaultValue={modal.item?.asset_tag || ""} required maxLength={80} /></label><label><span>Category</span><select name="category_id" defaultValue={modal.item?.category_id || ""} required><option value="" disabled>Select a category</option>{categoryOptions.map((option) => <option key={option.category_id} value={option.category_id}>{option.category_name}</option>)}</select></label></div>
+                  <label><span>Amount</span><input name="quantity" type="number" min="0" max="10000" step="1" defaultValue={modal.item?.quantity ?? 1} readOnly={modal.item?.tracking_mode === "unit"} required />{modal.item?.tracking_mode === "unit" && <small className="field-hint">Unit count is maintained from the equipment units page.</small>}</label>
+                  <div className="form-row"><label><span>Brand (optional)</span><input name="brand" defaultValue={modal.item?.brand || ""} maxLength={120} /></label><label><span>Model (optional)</span><input name="model" defaultValue={modal.item?.model || ""} maxLength={120} /></label></div>
+                  <label><span>Serial number (optional)</span><input name="serial_number" defaultValue={modal.item?.serial_number || ""} maxLength={160} /></label>
+                  <label><span>Storage location</span><input name="location" placeholder="Media office · Cabinet 2" defaultValue={modal.item?.location || ""} maxLength={200} /></label>
+                  <label><span>Description (optional)</span><textarea name="description" rows="3" placeholder="Condition, accessories, or notes" defaultValue={modal.item?.description || ""} maxLength={1000} /></label>
+                  <label><span>Equipment picture</span><input name="image" type="file" accept="image/jpeg,image/png,image/webp" /><small className="field-hint">JPEG, PNG, or WebP; 5 MB maximum, re-encoded before upload.</small></label>
+                  {modal.kind === "edit-equipment" && modal.item.image_url && (
+                    <div className="equipment-image-preview"><img src={modal.item.image_url} alt={`Current picture of ${modal.item.name}`} /><span>Current picture</span></div>
+                  )}
+                  {modal.kind === "edit-equipment" && modal.item.image_url && <label className="checkbox-label"><input name="remove_image" type="checkbox" /><span>Remove current picture</span></label>}
+                  {modal.kind === "edit-equipment" && <label><span>Condition</span><select name="condition_status" defaultValue={modal.item.condition_status === "fair" ? "" : modal.item.condition_status} required><option value="" disabled>Choose condition</option><option value="good">Good</option><option value="damaged">Damaged</option></select>{modal.item.condition_status === "fair" && <small className="field-hint">Previously saved as Fair. Choose Good or Damaged.</small>}</label>}
+                  {modal.kind === "edit-equipment" && <label><span>Availability</span><select name="status" defaultValue={modal.item.availability_status}><option value="available">Available</option><option value="maintenance">Maintenance</option><option value="retired">Retired</option>{["borrowed", "reserved"].includes(modal.item.availability_status) && <option value={modal.item.availability_status}>{modal.item.availability_status === "borrowed" ? "Borrowed" : "Reserved"} (manage through requests)</option>}</select></label>}
+                  <div className="modal-actions"><button type="button" className="button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button-primary" disabled={busy || (!categoryOptions.length && modal.kind === "add-equipment")} type="submit">{busy ? "Saving…" : modal.kind === "edit-equipment" ? "Save changes" : "Add to inventory"} {modal.kind === "edit-equipment" ? <Check size={15} /> : <Plus size={15} />}</button></div>
+                </form>
+              </>
+            ) : (
+              <>
+                <div className="modal-kicker">{modal.kind === "reservation" ? "RESERVE EQUIPMENT" : "BORROW EQUIPMENT"}</div>
+                <h2 id="modal-title">{modal.kind === "reservation" ? "Plan ahead" : "Request this equipment"}</h2>
+                <p className="modal-copy"><strong>{modal.item.name}</strong> · {modal.item.asset_tag} — {modal.kind === "reservation" ? "choose the dates you need it reserved." : "tell us when and where you’ll use it."}</p>
+                <form className="modal-form" onSubmit={submitRequest}>
+                  <PurposeField />
+                  <label><span>Location of use</span><input name="use_location" placeholder="Room, building, or event venue" required maxLength={200} /></label>
+                  <label><span>Amount</span><input name="amount" type="number" min="1" max={modal.kind === "reservation" ? modal.item.quantity : Math.max(1, modal.item.available_quantity || 1)} defaultValue="1" required /><small className="field-hint">{modal.kind === "reservation" ? `${modal.item.quantity} total units in inventory; availability is checked for your selected dates.` : `${modal.item.available_quantity ?? 0} units currently available.`}</small></label>
+                  {modal.kind === "reservation" ? <div className="form-row">
+                    <label><span>Reservation starts</span><input type="date" name="start_date" min={new Date().toISOString().slice(0, 10)} defaultValue={new Date().toISOString().slice(0, 10)} required /></label>
+                    <label><span>Pickup time</span><input type="time" name="start_time" defaultValue="09:00" required /></label>
+                    <label><span>Reservation ends</span><input type="date" name="end_date" min={new Date().toISOString().slice(0, 10)} defaultValue={new Date(Date.now() + 86400000).toISOString().slice(0, 10)} required /></label>
+                    <label><span>Return time</span><input type="time" name="end_time" defaultValue="17:00" required /></label>
+                  </div> : <div className="form-row">
+                    <label><span>Expected return date</span><input type="date" name="end_date" min={new Date().toISOString().slice(0, 10)} defaultValue={new Date(Date.now() + 86400000).toISOString().slice(0, 10)} required /></label>
+                    <label><span>Expected return time</span><input type="time" name="end_time" defaultValue="17:00" required /></label>
+                  </div>}
+                  {profile?.role === "staff" && (activeAgreement
+                    ? Number(acceptedAgreementVersion) !== Number(activeAgreement.version_id)
+                      ? <section className="borrower-agreement">
+                        <div><strong>{activeAgreement.title}</strong><small>Agreement version {activeAgreement.version_number}</small></div>
+                        <p>{activeAgreement.body_text}</p>
+                        <label className="checkbox-label"><input name="accept_agreement" type="checkbox" required /><span>I have read and agree to the borrower agreement above.</span></label>
+                      </section>
+                      : <p className="agreement-accepted"><CheckCircle2 size={16} /> You have accepted the current borrower agreement.</p>
+                    : <p className="feedback feedback-error" role="alert">The current borrower agreement is unavailable. Requests are disabled until an administrator or property custodian publishes or restores it.</p>)}
+                  <div className="modal-info"><ShieldCheck size={19} /><div><strong>Requests are reviewed by the equipment team</strong><span>You’ll see status updates in My equipment.</span></div></div>
+                  <div className="modal-actions"><button type="button" className="button-secondary" onClick={() => setModal(null)} disabled={busy}>Cancel</button><button className="button-primary" disabled={busy || (profile?.role === "staff" && !activeAgreement)} type="submit">{busy ? "Submitting…" : "Submit request"} <ArrowUpRight size={15} /></button></div>
+                </form>
+              </>
+            )}
+          </section>
+        </div>
+      )}
+      {recoveryMode && <PasswordRecoveryDialog supabase={supabase} onComplete={() => { setRecoveryMode(false); setNotice("Your password has been updated."); }} />}
+    </div>
+  );
+}
+
+function LoadingPanel() {
+  return <div className="loading-panel"><span className="spinner" /> Loading workspace data…</div>;
+}
+
+function PasswordRecoveryDialog({ supabase, onComplete }) {
+  const [password, setPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event) {
+    event.preventDefault();
+    if (password !== confirmation) {
+      setError("The passwords do not match.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const { error: updateError } = await supabase.auth.updateUser({ password });
+      if (updateError) setError(getErrorMessage(updateError));
+      else onComplete();
+    } catch (updateError) {
+      setError(getErrorMessage(updateError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-wrap">
+      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="recovery-title">
+        <div className="modal-kicker">ACCOUNT RECOVERY</div>
+        <h2 id="recovery-title">Choose a new password</h2>
+        <p className="modal-copy">Use at least 8 characters, then confirm your new password.</p>
+        <form className="modal-form" onSubmit={submit}>
+          <label><span>New password</span><input type="password" autoComplete="new-password" minLength={8} maxLength={128} value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
+          <label><span>Confirm new password</span><input type="password" autoComplete="new-password" minLength={8} maxLength={128} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} required /></label>
+          {error && <p className="feedback feedback-error" role="alert">{error}</p>}
+          <div className="modal-actions"><button className="button-primary" type="submit" disabled={busy}>{busy ? "Updating…" : "Update password"} <Check size={15} /></button></div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function BorrowingList({ rows, onRequestReturn, onCancelRequest, loading, page, hasMore, onPageChange }) {
+  if (loading) return <LoadingPanel />;
+  if (!rows.length) return <EmptyState title="No borrowing activity yet" copy="When you request equipment, updates will appear here." />;
+  return (
+    <div className="loan-list">
+      {rows.map((item) => (
+        <article className="loan-card" key={item.id}>
+          <div className="loan-art"><Laptop size={25} /></div>
+          <div className="loan-main">
+            <div className="loan-card-heading"><span className="card-category">{item.equipment?.category || "Equipment"}</span><StatusPill value={item.status} /></div>
+            <h2>{item.equipment?.name || "Equipment"}</h2>
+            <p>{item.equipment?.asset_tag || "—"} <i /> {item.quantity || 1} {Number(item.quantity || 1) === 1 ? "item" : "items"} <i /> {item.purpose || "No purpose specified"}</p>
+          </div>
+          <div className="loan-date"><span>Expected return</span><strong>{dateTimeLabel(item.expected_return)}</strong><BorrowingReturnTimes borrowingItems={item.borrowing_items} /><small className={item.expected_return && String(item.expected_return).slice(0, 10) < new Date().toISOString().slice(0, 10) && ACTIVE_BORROWING.includes(item.status) ? "due-soon" : ""}>{item.location_of_use || "Location not set"}</small><BorrowingConditionDetails borrowingItems={item.borrowing_items} /></div>
+          <div className="loan-actions">
+            {item.status === "requested" && <button className="button-secondary" type="button" onClick={() => onCancelRequest(item)}>Cancel request</button>}
+            {["released", "overdue"].includes(item.status) && <button className="button-secondary" onClick={() => onRequestReturn(item)}>Request return</button>}
+            {item.status === "return_requested" && <span className="return-note"><Clock3 size={14} /> Return requested</span>}
+          </div>
+        </article>
+      ))}
+      <nav className="unit-pagination" aria-label="Borrowing history pages"><span>Page {page + 1}</span><div><button className="button-secondary" type="button" onClick={() => onPageChange(Math.max(0, page - 1))} disabled={page === 0}><ArrowLeft size={14} /> Previous</button><button className="button-secondary" type="button" onClick={() => onPageChange(page + 1)} disabled={!hasMore}>Next <ArrowRight size={14} /></button></div></nav>
+    </div>
+  );
+}
+
+function PurposeField() {
+  const [selectedPurpose, setSelectedPurpose] = useState("");
+
+  return (
+    <>
+      <label><span>Purpose</span><select name="purpose" value={selectedPurpose} onChange={(event) => setSelectedPurpose(event.target.value)} required>
+        <option value="">Select purpose</option>
+        <option value="Practice">Practice</option>
+        <option value="Class activity">Class activity</option>
+        <option value="Event">Event</option>
+        <option value="Performance">Performance</option>
+        <option value="Other">Other</option>
+      </select></label>
+      {selectedPurpose === "Other" && <label><span>Other purpose</span><input name="purpose_other" placeholder="Describe the purpose" required maxLength={300} /></label>}
+    </>
+  );
+}
+
+function BorrowingReturnTimes({ borrowingItems = [] }) {
+  const returnedItems = borrowingItems.filter((item) => item.returned_at);
+  if (!returnedItems.length) return null;
+  return (
+    <div className="borrowing-return-times">
+      {returnedItems.map((item) => <small key={item.borrowing_item_id}>Actual return{item.equipment?.equipment_name ? ` · ${item.equipment.equipment_name}` : ""}: {dateTimeLabel(item.returned_at)}</small>)}
+    </div>
+  );
+}
+
+function BorrowingConditionDetails({ borrowingItems = [] }) {
+  const itemsWithConditions = borrowingItems.filter((item) => item.condition_at_release || item.condition_at_return);
+  if (!itemsWithConditions.length) return null;
+  return (
+    <div className="borrowing-condition-details">
+      {itemsWithConditions.map((item) => (
+        <small key={item.borrowing_item_id}>
+          {item.equipment?.equipment_name ? `${item.equipment.equipment_name}: ` : ""}
+          {[
+            item.condition_at_release ? `Condition upon release: ${String(item.condition_at_release).replaceAll("_", " ")}` : "",
+            item.condition_at_return ? `Condition upon return: ${String(item.condition_at_return).replaceAll("_", " ")}` : "",
+          ].filter(Boolean).join(" · ")}
+        </small>
+      ))}
+    </div>
+  );
+}
+
+function ReservationList({ rows, loading, admin = false, onCancel }) {
+  if (loading) return <LoadingPanel />;
+  if (!rows.length) return <EmptyState title="No reservations yet" copy="Reserve equipment for an upcoming project from the equipment library." />;
+  return (
+    <div className="reservation-list">
+      {rows.map((item) => (
+        <article className="reservation-row" key={item.id}>
+          <span className="reservation-icon"><CalendarDays size={18} /></span>
+          <div className="reservation-main"><strong>{item.equipment?.name || "Equipment"}</strong><span>{item.equipment?.asset_tag} · {item.quantity || 1} {Number(item.quantity || 1) === 1 ? "item" : "items"} · {item.purpose || "No purpose specified"}{admin && item.requester_email ? ` · ${item.requester_email}` : ""}</span></div>
+          <div className="reservation-dates"><strong>{dateLabel(item.start_date)} — {dateLabel(item.end_date)}</strong><span>{item.location_of_use || "Location not set"}</span></div>
+          <StatusPill value={item.status} />
+          {!admin && item.status === "pending" && <button className="button-secondary" type="button" onClick={() => onCancel(item)}>Cancel request</button>}
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function BorrowingTable({ rows, loading, page, hasMore, onPageChange }) {
+  if (loading) return <LoadingPanel />;
+  if (!rows.length) return <EmptyState title="No returned borrowing history" copy="Completed borrowing requests will appear here after equipment is returned." />;
+  return (
+    <>
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>Equipment</th><th>Borrower</th><th>Dates</th><th>Status</th></tr></thead>
+          <tbody>{rows.map((item) => <tr key={item.id}>
+            <td><strong>{item.equipment?.name || "Equipment"}</strong><small>{item.equipment?.asset_tag}</small><BorrowingConditionDetails borrowingItems={item.borrowing_items} /></td>
+            <td><strong>{item.borrower_name || "Member"}</strong><small>{item.borrower_email}</small></td>
+            <td><strong>{dateLabel(item.start_date)} – {dateTimeLabel(item.expected_return)}</strong><BorrowingReturnTimes borrowingItems={item.borrowing_items} /><small>{item.location_of_use || item.purpose}</small></td>
+            <td><StatusPill value={item.status} /></td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+      <nav className="unit-pagination" aria-label="Returned borrowing history pages">
+        <span>Page {page + 1}</span>
+        <div>
+          <button className="button-secondary" type="button" onClick={() => onPageChange(Math.max(0, page - 1))} disabled={page === 0}><ArrowLeft size={14} /> Previous</button>
+          <button className="button-secondary" type="button" onClick={() => onPageChange(page + 1)} disabled={!hasMore}>Next <ArrowRight size={14} /></button>
+        </div>
+      </nav>
+    </>
+  );
+}
+
+function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSearchChange, page, hasMore, onPageChange, busy, runAction, supabase, canReview, userId, refreshEquipment }) {
+  const [pickupGraceMinutes, setPickupGraceMinutes] = useState("");
+  const [settingsError, setSettingsError] = useState("");
+  const [workflowError, setWorkflowError] = useState("");
+  const [overdueItems, setOverdueItems] = useState([]);
+  const [overduePage, setOverduePage] = useState(0);
+  const [overdueSearch, setOverdueSearch] = useState("");
+  const [overdueReturnItem, setOverdueReturnItem] = useState(null);
+  const [overdueReturnLoadingId, setOverdueReturnLoadingId] = useState(null);
+  const [damageReports, setDamageReports] = useState([]);
+  const [savingDamageReportId, setSavingDamageReportId] = useState(null);
+  const [damageReportError, setDamageReportError] = useState("");
+  const [returnedHistory, setReturnedHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyPage, setHistoryPage] = useState(0);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [workflowRefreshKey, setWorkflowRefreshKey] = useState(0);
+  const query = borrowerSearch.trim().toLocaleLowerCase();
+  const matchesBorrower = (name, email) => !query
+    || `${name || ""} ${email || ""}`.toLocaleLowerCase().includes(query)
+    || String(name || "").toLocaleLowerCase().split(/\s+/).some((part) => part.startsWith(query));
+  useEffect(() => {
+    if (!canReview) return undefined;
+    let active = true;
+    async function loadOperationalData() {
+      setHistoryLoading(true);
+      const [settingsResult, overdueResult, reportResult, historyResult] = await Promise.all([
+        supabase.from("reservation_settings")
+          .select("pickup_grace_period_minutes")
+          .eq("singleton", true)
+          .single(),
+        supabase.rpc("list_overdue_borrowings_page", { p_page: overduePage, p_search: overdueSearch.trim() || null }),
+        supabase.rpc("list_damage_loss_reports"),
+        supabase.from("borrowings")
+          .select("borrowing_id, request_date, expected_return_date, destination, purpose, transaction_status, created_at, borrowers(first_name, middle_name, last_name, email), borrowing_items(borrowing_item_id, quantity, returned_at, condition_at_release, condition_at_return, equipment(equipment_name, asset_code))")
+          .eq("transaction_status", "returned")
+          .order("created_at", { ascending: false })
+          .range(historyPage * 20, historyPage * 20 + 19),
+      ]);
+      if (!active) return;
+      if (settingsResult.error) {
+        console.error("Reservation pickup settings could not be loaded:", settingsResult.error);
+        setSettingsError("Reservation pickup settings are unavailable right now.");
+      } else if (!settingsResult.data) {
+        setSettingsError("Reservation pickup settings are unavailable right now.");
+      } else {
+        setPickupGraceMinutes(String(settingsResult.data.pickup_grace_period_minutes));
+      }
+      let hasLoadError = false;
+      if (overdueResult.error) {
+        console.error("The overdue list could not be loaded:", overdueResult.error);
+        hasLoadError = true;
+        setOverdueItems([]);
+      } else {
+        setOverdueItems(overdueResult.data || []);
+      }
+      if (reportResult.error) {
+        console.error("Damage and loss reports could not be loaded:", reportResult.error);
+        hasLoadError = true;
+        setDamageReports([]);
+      } else {
+        setDamageReports((reportResult.data || []).filter((report) => report.resolution_status !== "resolved"));
+      }
+      if (historyResult.error) {
+        console.error("Returned borrowing history could not be loaded:", historyResult.error);
+        hasLoadError = true;
+        setReturnedHistory([]);
+        setHistoryHasMore(false);
+      } else {
+        const historyRows = historyResult.data || [];
+        setHistoryHasMore(historyRows.length === 20);
+        setReturnedHistory(historyRows.map((item) => {
+          const borrower = item.borrowers || {};
+          const borrowingItems = item.borrowing_items || [];
+          return {
+            id: item.borrowing_id,
+            start_date: item.request_date,
+            expected_return: item.expected_return_date,
+            location_of_use: item.destination,
+            purpose: item.purpose,
+            status: item.transaction_status,
+            borrower_name: [borrower.first_name, borrower.middle_name, borrower.last_name].filter(Boolean).join(" "),
+            borrower_email: borrower.email || "",
+            equipment: {
+              name: borrowingItems.map((detail) => detail.equipment?.equipment_name).filter(Boolean).join(", ") || "Equipment",
+              asset_tag: borrowingItems.map((detail) => detail.equipment?.asset_code).filter(Boolean).join(", "),
+            },
+            borrowing_items: borrowingItems,
+          };
+        }));
+      }
+      setHistoryLoading(false);
+      setWorkflowError(hasLoadError ? "Some request information is unavailable right now." : "");
+    }
+    loadOperationalData().catch((loadError) => {
+      console.error("Request operations could not be loaded:", loadError);
+      if (active) {
+        setHistoryLoading(false);
+        setWorkflowError("Request information is unavailable right now.");
+      }
+    });
+    return () => { active = false; };
+  }, [canReview, supabase, workflowRefreshKey, overduePage, overdueSearch, historyPage]);
+
+  async function savePickupGracePeriod(event) {
+    event.preventDefault();
+    const minutes = Number(pickupGraceMinutes);
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) {
+      setSettingsError("Enter a pickup grace period from 1 to 1440 minutes.");
+      return;
+    }
+    setSettingsError("");
+    await runAction(
+      () => supabase.from("reservation_settings")
+        .update({ pickup_grace_period_minutes: minutes })
+        .eq("singleton", true)
+        .select("pickup_grace_period_minutes")
+        .single(),
+      "Reservation pickup grace period updated.",
+    );
+  }
+
+  async function submitCondition(item, stage, condition, file, notes, unitAssignments = [], affectedQuantities = {}) {
+    const successMessage = stage === "release" ? "Equipment released to borrower." : "Equipment return recorded.";
+    const completed = await runAction(async () => {
+      const photoPath = await uploadItemConditionPhoto(
+        supabase,
+        userId,
+        file,
+        `${stage} condition`,
+      );
+      const { error } = stage === "release" && item.unit_items?.length
+        ? await supabase.rpc("release_equipment_borrowing_units", {
+          p_borrowing_id: item.id,
+          p_assignments: unitAssignments,
+          p_condition: condition,
+          p_photo_path: photoPath,
+          p_condition_notes: notes || null,
+        })
+        : stage === "return" && item.active_unit_item
+          ? await supabase.rpc("complete_equipment_unit_return", {
+            p_borrowing_item_id: item.active_unit_item.borrowing_item_id,
+            p_condition: condition,
+            p_asset_tag: unitAssignments[0]?.asset_tag || null,
+            p_photo_path: photoPath,
+            p_condition_notes: notes || null,
+          })
+          : await supabase.rpc(stage === "release" ? "release_equipment_borrowing" : "complete_equipment_return", {
+            p_borrowing_id: item.id,
+            p_condition: condition,
+            p_photo_path: photoPath,
+            p_condition_notes: notes || null,
+            p_affected_quantities: affectedQuantities,
+          });
+      if (error) {
+        if (photoPath) {
+          const { error: cleanupError } = await supabase.storage
+            .from("item-condition-photos")
+            .remove([photoPath]);
+          if (cleanupError) {
+            console.error("The uploaded condition photo could not be removed:", cleanupError);
+            throw new Error("The action failed and the uploaded condition photo could not be removed.");
+          }
+        }
+        throw error;
+      }
+      return { error: null };
+    }, successMessage);
+    if (completed) setWorkflowRefreshKey((key) => key + 1);
+    return completed;
+  }
+
+  async function openOverdueReturn(overdueItem) {
+    setWorkflowError("");
+    setOverdueReturnItem(null);
+    setOverdueReturnLoadingId(overdueItem.borrowing_id);
+    try {
+      const { data, error } = await supabase.from("borrowings")
+        .select("borrowing_id, transaction_status, borrowing_items(borrowing_item_id, equipment_id, item_status, quantity, is_overdue, equipment(equipment_id, tracking_mode))")
+        .eq("borrowing_id", overdueItem.borrowing_id)
+        .maybeSingle();
+      if (error) throw error;
+      const borrowingItems = data?.borrowing_items || [];
+      const overdueBorrowingItem = borrowingItems.find((item) =>
+        item.borrowing_item_id === overdueItem.borrowing_item_id
+        && item.item_status === "released"
+        && item.is_overdue);
+      if (data?.transaction_status !== "released" || !overdueBorrowingItem) {
+        throw new Error("This overdue item is no longer awaiting return. Refresh the list and try again.");
+      }
+      setOverdueReturnItem({
+        id: data.borrowing_id,
+        unit_items: borrowingItems
+          .filter((item) => item.equipment?.tracking_mode === "unit")
+          .map((item) => ({
+            borrowing_item_id: item.borrowing_item_id,
+            equipment_id: item.equipment_id,
+            item_status: item.item_status,
+            quantity: item.quantity,
+          })),
+        quantity_items: borrowingItems
+          .filter((item) => item.equipment?.tracking_mode !== "unit")
+          .map((item) => ({
+            borrowing_item_id: item.borrowing_item_id,
+            equipment_id: item.equipment_id,
+            equipment_name: item.equipment?.equipment_name || "Equipment",
+            quantity: item.quantity,
+          })),
+      });
+    } catch (actionError) {
+      setWorkflowError(`The overdue item could not be prepared for return: ${getErrorMessage(actionError)}`);
+    } finally {
+      setOverdueReturnLoadingId(null);
+    }
+  }
+
+  async function resolveReport(reportId, status, notes, isRecovered) {
+    setSavingDamageReportId(reportId);
+    setDamageReportError("");
+    try {
+      const result = await supabase.rpc("resolve_damage_loss_report", {
+        p_report_id: reportId,
+        p_resolution_status: status,
+        p_resolution_notes: notes,
+        p_is_recovered: isRecovered,
+      });
+      if (result.error) throw result.error;
+      setDamageReports((current) => status === "resolved"
+        ? current.filter((report) => report.report_id !== reportId)
+        : current.map((report) => report.report_id === reportId
+          ? { ...report, resolution_status: status, resolution_notes: notes || null, is_recovered: isRecovered }
+          : report));
+      setWorkflowRefreshKey((key) => key + 1);
+      await refreshEquipment();
+      return result.data || "Resolution saved.";
+    } catch (saveError) {
+      console.error("The damage or loss report resolution could not be saved:", saveError);
+      setDamageReportError(getErrorMessage(saveError));
+      return false;
+    } finally {
+      setSavingDamageReportId(null);
+    }
+  }
+
+  const pendingBorrowings = borrowings.filter((item) =>
+    item.status === "requested"
+      && matchesBorrower(item.borrower_name, item.borrower_email));
+  const approvedBorrowings = borrowings.filter((item) =>
+    item.status === "approved"
+      && matchesBorrower(item.borrower_name, item.borrower_email));
+  const releasedBorrowings = borrowings.filter((item) =>
+    ["released", "overdue", "return_requested"].includes(item.status)
+      && matchesBorrower(item.borrower_name, item.borrower_email));
+  const pendingReservations = reservations.filter((item) =>
+    item.status === "pending"
+      && matchesBorrower(item.requester_name, item.requester_email));
+  const approvedReservations = reservations.filter((item) =>
+    item.status === "approved" && !item.picked_up_at
+      && matchesBorrower(item.requester_name, item.requester_email));
+  return (
+    <>
+      <div className="toolbar request-search-toolbar">
+        <label className="search-box"><Search size={18} /><input value={borrowerSearch} onChange={(event) => onSearchChange(event.target.value)} placeholder="Search borrower first or last name" aria-label="Search borrower requests by first or last name" /><kbd>⌕</kbd></label>
+        <span className="filter-caption">{pendingBorrowings.length + pendingReservations.length} matching requests</span>
+        <div className="unit-pagination"><span>Borrowings page {page + 1}</span><div><button className="button-secondary" type="button" onClick={() => onPageChange(Math.max(0, page - 1))} disabled={page === 0}><ArrowLeft size={14} /> Previous</button><button className="button-secondary" type="button" onClick={() => onPageChange(page + 1)} disabled={!hasMore}>Next <ArrowRight size={14} /></button></div></div>
+      </div>
+      {canReview && <div className="toolbar reservation-grace-toolbar">
+        <div className="reservation-grace-copy"><strong>Reservation pickup grace period</strong><small>Unpicked reservations expire this many minutes after their scheduled start.</small></div>
+        <form className="reservation-grace-form" onSubmit={savePickupGracePeriod}>
+          <label>
+            <span className="sr-only">Pickup grace period in minutes</span>
+            <input
+              type="number"
+              min="1"
+              max="1440"
+              step="1"
+              value={pickupGraceMinutes}
+              onChange={(event) => setPickupGraceMinutes(event.target.value)}
+              disabled={busy || !pickupGraceMinutes}
+              required
+            />
+          </label>
+          <span>minutes</span>
+          <button className="button-primary" type="submit" disabled={busy || !pickupGraceMinutes}>Save</button>
+        </form>
+        {settingsError && <p className="reservation-grace-error" role="alert">{settingsError}</p>}
+      </div>}
+      <div className="section-title"><div><h2>Borrowing requests</h2><p>{canReview ? "Review new requests before approving the scheduled release." : "Search requests using a borrower's first or last name."}</p></div><span className="record-count">{pendingBorrowings.length} to review</span></div>
+      {!pendingBorrowings.length ? <EmptyState title={query ? "No matching borrowing requests" : "All caught up"} copy={query ? "Try another first or last name." : "There are no borrowing or return requests waiting for review."} /> : (
+        <div className="admin-request-list">
+          {pendingBorrowings.map((item) => (
+            <article className="admin-request" key={item.id}>
+              <div className="loan-art"><Laptop size={23} /></div>
+              <div className="admin-request-main"><div className="loan-card-heading"><span className="card-category">{item.equipment?.asset_tag}</span><StatusPill value={item.status} /></div><h2>{item.equipment?.name || "Equipment"}</h2><p>{item.borrower_name} · {item.borrower_email || item.borrower_id} · {item.quantity || 1} {Number(item.quantity || 1) === 1 ? "item" : "items"} · {item.purpose}</p><small>{dateLabel(item.start_date)} – {dateTimeLabel(item.expected_return)} · {item.location_of_use}</small></div>
+              {canReview && <div className="admin-actions">
+                <DeclineRequestControl
+                  busy={busy}
+                  onDecline={(reason) => runAction(
+                    () => supabase.rpc("review_borrowing_request", {
+                      p_borrowing_id: item.id,
+                      p_action: "reject",
+                      p_decline_reason: reason,
+                    }),
+                    "Request declined.",
+                  )}
+                />
+                <button className="button-primary" disabled={busy} onClick={() => runAction(() => supabase.rpc("review_borrowing_request", { p_borrowing_id: item.id, p_action: "approve" }), "Borrowing request approved.")}><Check size={15} /> Approve</button>
+              </div>}
+            </article>
+          ))}
+        </div>
+      )}
+      <div className="section-title"><div><h2>Approved — awaiting release</h2><p>Record the condition and optional photo when equipment is handed to the borrower.</p></div><span className="record-count">{approvedBorrowings.length} approved</span></div>
+      {!approvedBorrowings.length ? <EmptyState title="No approved borrowing requests awaiting release" copy={query ? "Try another first or last name." : "Approved requests will appear here until equipment is released."} /> : (
+        <div className="admin-request-list">
+          {approvedBorrowings.map((item) => (
+            <article className="admin-request" key={item.id}>
+              <div className="loan-art"><Laptop size={23} /></div>
+              <div className="admin-request-main"><div className="loan-card-heading"><span className="card-category">{item.equipment?.asset_tag}</span><StatusPill value={item.status} /></div><h2>{item.equipment?.name || "Equipment"}</h2><p>{item.borrower_name} · {item.borrower_email} · {item.quantity || 1} {Number(item.quantity || 1) === 1 ? "item" : "items"} · {item.purpose}</p><small>{dateLabel(item.start_date)} – {dateTimeLabel(item.expected_return)} · {item.location_of_use}</small></div>
+              {canReview && <WorkflowConditionAction
+                stage="release"
+                busy={busy}
+                supabase={supabase}
+                item={item}
+                refreshKey={workflowRefreshKey}
+                onSubmit={(condition, file, notes, assignments, affectedQuantities) => submitCondition(item, "release", condition, file, notes, assignments, affectedQuantities)}
+              />}
+            </article>
+          ))}
+        </div>
+      )}
+      <div className="section-title"><div><h2>Released — awaiting return</h2><p>Record the received condition; damage or loss reports are created when applicable.</p></div><span className="record-count">{releasedBorrowings.length} released</span></div>
+      {!releasedBorrowings.length ?       <EmptyState title="No released equipment awaiting return" copy={query ? "Try another first or last name." : "Released equipment will appear here until an administrator or custodian records its return."} /> : (
+        <div className="admin-request-list">
+          {releasedBorrowings.map((item) => (
+            <article className="admin-request" key={item.id}>
+              <div className="loan-art"><Laptop size={23} /></div>
+              <div className="admin-request-main"><div className="loan-card-heading"><span className="card-category">{item.equipment?.asset_tag}</span><StatusPill value={item.status} /></div><h2>{item.equipment?.name || "Equipment"}</h2><p>{item.borrower_name} · {item.borrower_email} · {item.quantity || 1} {Number(item.quantity || 1) === 1 ? "item" : "items"} · {item.purpose}</p><small>Due {dateTimeLabel(item.expected_return)} · {item.location_of_use}{item.status === "return_requested" ? " · Return requested" : ""}</small><BorrowingConditionDetails borrowingItems={item.borrowing_items} /></div>
+              {canReview && <WorkflowConditionAction
+                stage="return"
+                busy={busy}
+                supabase={supabase}
+                item={item}
+                refreshKey={workflowRefreshKey}
+                onSubmit={(condition, file, notes, assignments, affectedQuantities) => submitCondition({ ...item, active_unit_item: assignments[0] }, "return", condition, file, notes, assignments, affectedQuantities)}
+              />}
+            </article>
+          ))}
+        </div>
+      )}
+      {canReview && <>
+        <div className="section-title"><div><h2>Overdue items</h2><p>Borrowers with overdue items cannot submit new borrowing or reservation requests.</p></div><span className="record-count">{overdueItems.length} overdue</span></div>
+        <label className="search-box overdue-search"><Search size={16} /><input value={overdueSearch} onChange={(event) => { setOverdueSearch(event.target.value); setOverduePage(0); }} placeholder="Search overdue items or borrower" aria-label="Search overdue items" /></label>
+        {workflowError && <p className="reservation-grace-error" role="alert">{workflowError}</p>}
+        {!overdueItems.length ? <EmptyState title="No overdue items" copy="Items past their return date will be listed here after the daily overdue check." /> : (
+          <div className="table-wrap inventory-table">
+            <table><thead><tr><th>Equipment</th><th>Borrower</th><th>Contact</th><th>Due</th><th>Quantity</th><th>Action</th></tr></thead>
+              <tbody>{overdueItems.map((item) => <tr key={item.borrowing_item_id}>
+                <td><strong>{item.equipment_name}</strong><small>{item.asset_code}</small></td>
+                <td><strong>{item.borrower_name}</strong><small>{item.department || "Department not set"}</small></td>
+                <td><a href={`mailto:${encodeURIComponent(item.borrower_email)}`}>{item.borrower_email}</a>{item.borrower_phone && <small>{item.borrower_phone}</small>}</td>
+                <td>{dateTimeLabel(item.expected_return_at)}</td>
+                <td>{item.quantity}</td>
+                <td><button className="button-secondary" type="button" onClick={() => openOverdueReturn(item)} disabled={busy || overdueReturnLoadingId !== null}>{overdueReturnLoadingId === item.borrowing_id ? "Loading..." : "Record return"}</button></td>
+              </tr>)}</tbody>
+            </table>
+          </div>
+        )}
+        {overdueReturnItem && <article className="admin-request overdue-return-action">
+          <div className="admin-request-main">
+            <h2>Record overdue return</h2>
+            <p>Confirm the received condition. Damaged or lost returns create a damage/loss report automatically.</p>
+          </div>
+          <WorkflowConditionAction
+            stage="return"
+            busy={busy}
+            supabase={supabase}
+            item={overdueReturnItem}
+            refreshKey={workflowRefreshKey}
+            onSubmit={async (condition, file, notes, assignments, affectedQuantities) => {
+              const completed = await submitCondition(
+                { ...overdueReturnItem, active_unit_item: assignments[0] },
+                "return",
+                condition,
+                file,
+                notes,
+                assignments,
+                affectedQuantities,
+              );
+              if (completed) setOverdueReturnItem(null);
+            }}
+          />
+          <button className="button-secondary" type="button" onClick={() => setOverdueReturnItem(null)} disabled={busy}>Cancel</button>
+        </article>}
+        <nav className="unit-pagination" aria-label="Overdue item pages"><span>Page {overduePage + 1} · {overdueItems.length} items</span><div><button className="button-secondary" type="button" onClick={() => setOverduePage((page) => Math.max(0, page - 1))} disabled={overduePage === 0}><ArrowLeft size={14} /> Previous</button><button className="button-secondary" type="button" onClick={() => setOverduePage((page) => page + 1)} disabled={overdueItems.length < 20}>Next <ArrowRight size={14} /></button></div></nav>
+        <div className="section-title"><div><h2>Damage and loss reports</h2><p>Track follow-up and resolution for reported damage or lost items.</p></div><span className="record-count">{damageReports.length} reports</span></div>
+        {damageReportError && <p className="feedback feedback-error" role="alert">{damageReportError}</p>}
+        {!damageReports.length ? <EmptyState title="No damage or loss reports" copy="Reports will be created when an administrator or custodian records damaged or lost equipment." /> : (
+          <div className="admin-request-list">
+            {damageReports.map((report) => <DamageLossReportControl
+              key={report.report_id}
+              report={report}
+              busy={busy || savingDamageReportId !== null}
+              saving={savingDamageReportId === report.report_id}
+              onSave={(status, notes, isRecovered) => resolveReport(report.report_id, status, notes, isRecovered)}
+            />)}
+          </div>
+        )}
+      </>}
+      <div className="section-title"><div><h2>Reservation requests</h2><p>Check availability before confirming upcoming dates.</p></div><span className="record-count">{pendingReservations.length} to review</span></div>
+      {!pendingReservations.length ? <EmptyState title={query ? "No matching reservation requests" : "No reservations to review"} copy={query ? "Try another first or last name." : "New reservation requests will appear here."} /> : (
+        <div className="admin-request-list">
+          {pendingReservations.map((item) => (
+            <article className="admin-request" key={item.id}>
+              <span className="reservation-icon"><CalendarDays size={19} /></span>
+              <div className="admin-request-main"><div className="loan-card-heading"><span className="card-category">{item.equipment?.asset_tag}</span><StatusPill value={item.status} /></div><h2>{item.equipment?.name || "Equipment"}</h2><p>{item.requester_name} · {item.requester_email || item.requester_id} · {item.quantity || 1} {Number(item.quantity || 1) === 1 ? "item" : "items"} · {item.purpose}</p><small>{dateLabel(item.start_date)} – {dateLabel(item.end_date)} · {item.location_of_use}</small></div>
+              {canReview && <div className="admin-actions">
+                <DeclineRequestControl
+                  busy={busy}
+                  onDecline={(reason) => runAction(
+                    () => supabase.rpc("review_equipment_reservation", {
+                      p_reservation_id: item.id,
+                      p_action: "reject",
+                      p_decline_reason: reason,
+                    }),
+                    "Reservation declined.",
+                  )}
+                />
+                <button className="button-primary" disabled={busy} onClick={() => runAction(() => supabase.rpc("review_equipment_reservation", { p_reservation_id: item.id, p_action: "approve" }), "Reservation approved.")}><Check size={15} /> Approve</button>
+              </div>}
+            </article>
+          ))}
+        </div>
+      )}
+      <div className="section-title"><div><h2>Approved reservations awaiting pickup</h2><p>Mark reservations picked up so they are not automatically released.</p></div><span className="record-count">{approvedReservations.length} awaiting pickup</span></div>
+      {!approvedReservations.length ? <EmptyState title="No approved reservations awaiting pickup" copy={query ? "Try another first or last name." : "Approved reservations will appear here until they are picked up or their pickup grace period expires."} /> : (
+        <div className="admin-request-list">
+          {approvedReservations.map((item) => (
+            <article className="admin-request" key={item.id}>
+              <span className="reservation-icon"><CalendarDays size={19} /></span>
+              <div className="admin-request-main"><div className="loan-card-heading"><span className="card-category">{item.equipment?.asset_tag}</span><StatusPill value={item.status} /></div><h2>{item.equipment?.name || "Equipment"}</h2><p>{item.requester_name} · {item.requester_email || item.requester_id} · {item.quantity || 1} {Number(item.quantity || 1) === 1 ? "item" : "items"} · {item.purpose}</p><small>{dateLabel(item.start_date)} – {dateLabel(item.end_date)} · {item.location_of_use}</small></div>
+              {canReview && <div className="admin-actions">
+                <button className="button-primary" disabled={busy} onClick={() => runAction(
+                  () => supabase.rpc("mark_reservation_picked_up", { p_reservation_id: item.id }),
+                  "Reservation marked as picked up.",
+                )}><CheckCircle2 size={15} /> Mark picked up</button>
+              </div>}
+            </article>
+          ))}
+        </div>
+      )}
+      {canReview && <>
+        <div className="section-title"><div><h2>Borrowing history</h2><p>Compare the expected return with the actual return time and recorded item conditions.</p></div></div>
+        <BorrowingTable rows={returnedHistory} loading={historyLoading} page={historyPage} hasMore={historyHasMore} onPageChange={setHistoryPage} />
+      </>}
+    </>
+  );
+}
+
+function DeclineRequestControl({ busy, onDecline }) {
+  const [reason, setReason] = useState("");
+
+  async function submit(event) {
+    event.preventDefault();
+    const declineReason = reason.trim();
+    if (!declineReason) return;
+    if (await onDecline(declineReason)) setReason("");
+  }
+
+  return (
+    <form className="admin-actions" onSubmit={submit}>
+      <label>
+        <span className="sr-only">Reason for declining this request</span>
+        <input
+          value={reason}
+          onChange={(event) => setReason(event.target.value)}
+          placeholder="Reason required"
+          maxLength={500}
+          required
+        />
+      </label>
+      <button className="button-secondary" type="submit" disabled={busy || !reason.trim()}>Decline</button>
+    </form>
+  );
+}
+
+function WorkflowConditionAction({ stage, busy, onSubmit, supabase, item, refreshKey }) {
+  const [condition, setCondition] = useState("good");
+  const [notes, setNotes] = useState("");
+  const [unitAssignments, setUnitAssignments] = useState([]);
+  const [affectedQuantities, setAffectedQuantities] = useState(() =>
+    Object.fromEntries((item.quantity_items || []).map((quantityItem) => [quantityItem.borrowing_item_id, "1"])));
+  const [assignedUnits, setAssignedUnits] = useState([]);
+  const [unitError, setUnitError] = useState("");
+  const unitItems = item.unit_items || [];
+  const quantityItems = item.quantity_items || [];
+
+  useEffect(() => {
+    if (stage !== "return" || !unitItems.length) return undefined;
+    let active = true;
+    supabase.rpc("list_borrowing_unit_assignments", { p_borrowing_id: item.id }).then(({ data, error }) => {
+      if (!active) return;
+      if (error) {
+        console.error("Unit assignments could not be loaded:", error);
+        setUnitError("Unit assignments are unavailable right now.");
+      }
+      else setAssignedUnits((data || []).filter((assignment) => assignment.unit_status === "borrowed"));
+    });
+    return () => { active = false; };
+  }, [stage, supabase, item.id, unitItems.length, refreshKey]);
+
+  async function lookupUnit(index, tag) {
+    const assetTag = tag.trim();
+    if (!assetTag) return;
+    setUnitError("");
+    const { data, error } = await supabase.rpc("lookup_equipment_unit_by_tag", { p_asset_tag: assetTag });
+    if (error) {
+      console.error("The equipment unit could not be found:", error);
+      setUnitError("The equipment unit could not be found. Check the asset tag and try again.");
+      return;
+    }
+    const unit = data?.[0];
+    const expectedItem = stage === "release" ? unitItems[index] : null;
+    if (!unit) {
+      setUnitError(`Unknown asset tag: ${assetTag}`);
+      return;
+    }
+    if (stage === "release" && (unit.status !== "available" || unit.equipment_id !== expectedItem.equipment_id)) {
+      setUnitError(`Unit ${assetTag} is unavailable or belongs to different equipment.`);
+      return;
+    }
+    const assignedUnit = stage === "return"
+      ? assignedUnits.find((assignment) => assignment.unit_id === unit.unit_id && assignment.unit_status === "borrowed")
+      : null;
+    if (stage === "return" && !assignedUnit) {
+      setUnitError(`Unit ${assetTag} is not assigned to this active borrowing.`);
+      return;
+    }
+    setUnitAssignments((current) => {
+      const next = [...current];
+      next[index] = stage === "release"
+        ? { borrowing_item_id: expectedItem.borrowing_item_id, unit_id: unit.unit_id, asset_tag: unit.asset_tag }
+        : { borrowing_item_id: assignedUnit.borrowing_item_id, unit_id: unit.unit_id, asset_tag: unit.asset_tag };
+      return next;
+    });
+  }
+
+  function submit(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    onSubmit(
+      condition,
+      form.get("condition_photo"),
+      notes.trim(),
+      unitAssignments,
+      Object.fromEntries(Object.entries(affectedQuantities).map(([id, quantity]) => [id, Number(quantity)])),
+    );
+  }
+
+  const needsReport = stage === "release"
+    ? condition === "damaged"
+    : ["damaged", "lost"].includes(condition);
+  const isRelease = stage === "release";
+  const missingUnitAssignment = unitItems.length > 0
+    && (isRelease
+      ? unitAssignments.length !== unitItems.length || unitAssignments.some((assignment) => !assignment?.unit_id)
+      : !unitAssignments[0]?.asset_tag || !unitAssignments[0]?.borrowing_item_id);
+  const invalidAffectedQuantity = needsReport && quantityItems.some((quantityItem) => {
+    const quantity = Number(affectedQuantities[quantityItem.borrowing_item_id] || 0);
+    return !Number.isInteger(quantity) || quantity < 1 || quantity > quantityItem.quantity;
+  });
+
+  return (
+    <form className="workflow-condition-form" onSubmit={submit}>
+      <label>
+        <span>{isRelease ? "Condition at release" : "Condition at return"}</span>
+        <select value={condition} onChange={(event) => setCondition(event.target.value)} disabled={busy}>
+          <option value="good">Good</option>
+          <option value="damaged">Damaged</option>
+          {!isRelease && <option value="lost">Lost</option>}
+        </select>
+      </label>
+      {unitItems.length > 0 && (isRelease ? (
+        <fieldset className="unit-assignment-fields">
+          <legend>Assign a unit to each item</legend>
+          {unitItems.map((unitItem, index) => <UnitTagField
+            key={unitItem.borrowing_item_id}
+            label={`Unit ${index + 1} of ${unitItems.length}`}
+            value={unitAssignments[index]?.asset_tag || ""}
+            disabled={busy}
+            onChange={(value) => setUnitAssignments((current) => {
+              const next = [...current];
+              next[index] = null;
+              return next;
+            })}
+            onLookup={(value) => lookupUnit(index, value)}
+          />)}
+          {unitError && <p className="feedback feedback-error" role="alert">{unitError}</p>}
+        </fieldset>
+      ) : (
+        <fieldset className="unit-assignment-fields">
+          <legend>Scan or enter the returned unit tag</legend>
+          <UnitTagField
+            label="Assigned unit"
+            value={unitAssignments[0]?.asset_tag || ""}
+            disabled={busy || assignedUnits.length === 0}
+            onChange={() => setUnitAssignments([])}
+            onLookup={(value) => lookupUnit(0, value)}
+          />
+          {unitError && <p className="feedback feedback-error" role="alert">{unitError}</p>}
+        </fieldset>
+      ))}
+      {needsReport && quantityItems.length > 0 && (
+        <fieldset className="unit-assignment-fields">
+          <legend>Affected quantity</legend>
+          {quantityItems.map((quantityItem) => (
+            <label key={quantityItem.borrowing_item_id}>
+              <span>{quantityItem.equipment_name}</span>
+              <input
+                type="number"
+                min="1"
+                max={quantityItem.quantity}
+                value={affectedQuantities[quantityItem.borrowing_item_id] || ""}
+                onChange={(event) => setAffectedQuantities((current) => ({
+                  ...current,
+                  [quantityItem.borrowing_item_id]: event.target.value,
+                }))}
+                disabled={busy}
+                required
+              />
+              <small className="field-hint">Up to {quantityItem.quantity} borrowed units.</small>
+            </label>
+          ))}
+        </fieldset>
+      )}
+      {needsReport && <label>
+        <span>{condition === "lost" ? "Loss details" : "Damage details"}</span>
+        <textarea value={notes} onChange={(event) => setNotes(event.target.value)} maxLength={2000} rows="2" required disabled={busy} />
+      </label>}
+      <label>
+        <span>Condition photo (optional)</span>
+        <input name="condition_photo" type="file" accept="image/jpeg,image/png,image/webp" disabled={busy} />
+      </label>
+      <button className="button-primary" type="submit" disabled={busy || missingUnitAssignment || invalidAffectedQuantity || (needsReport && !notes.trim())}>
+        {isRelease ? "Record release" : "Receive return"}
+      </button>
+    </form>
+  );
+}
+
+function UnitTagField({ label, value, disabled, onChange, onLookup }) {
+  const [tag, setTag] = useState(value);
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [cameraError, setCameraError] = useState("");
+  const videoRef = useRef(null);
+  const lookupRef = useRef(onLookup);
+  const changeRef = useRef(onChange);
+  lookupRef.current = onLookup;
+  changeRef.current = onChange;
+
+  useEffect(() => {
+    if (!cameraOpen) return undefined;
+    let active = true;
+    let stream;
+    let animationFrame;
+    async function scan() {
+      if (!("BarcodeDetector" in window)) {
+        setCameraError("QR scanning is not supported in this browser. Enter the asset tag manually.");
+        setCameraOpen(false);
+        return;
+      }
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        if (!active) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+        const detector = new window.BarcodeDetector({ formats: ["qr_code"] });
+        const detectFrame = async () => {
+          if (!active || !videoRef.current) return;
+          try {
+            const codes = await detector.detect(videoRef.current);
+            if (codes[0]?.rawValue) {
+              const scannedTag = codes[0].rawValue;
+              setTag(scannedTag);
+              changeRef.current(scannedTag);
+              await lookupRef.current(scannedTag);
+              setCameraOpen(false);
+              return;
+            }
+          } catch {
+            setCameraError("Could not read the QR code. Try entering the asset tag manually.");
+          }
+          animationFrame = window.requestAnimationFrame(detectFrame);
+        };
+        detectFrame();
+      } catch (scanError) {
+        console.error("QR scanner could not access the camera:", scanError);
+        setCameraError("Camera access failed. Enter the asset tag manually.");
+        setCameraOpen(false);
+      }
+    }
+    scan();
+    return () => {
+      active = false;
+      window.cancelAnimationFrame(animationFrame);
+      stream?.getTracks().forEach((track) => track.stop());
+    };
+  }, [cameraOpen]);
+
+  return (
+    <div className="unit-tag-field">
+      <label><span>{label}</span><input value={tag} onChange={(event) => { setTag(event.target.value); onChange(event.target.value); }} disabled={disabled} maxLength={120} required /></label>
+      <button className="button-secondary" type="button" disabled={disabled} onClick={() => onLookup(tag)} title="Look up this asset tag">Look up</button>
+      <button className="button-icon" type="button" disabled={disabled} onClick={() => { setCameraError(""); setCameraOpen(true); }} aria-label="Scan QR code" title="Scan QR code"><Camera size={16} /></button>
+      {cameraOpen && <div className="unit-camera-panel"><video ref={videoRef} muted playsInline /><button className="button-secondary" type="button" onClick={() => setCameraOpen(false)}>Stop camera</button></div>}
+      {cameraError && <small className="unit-camera-error" role="alert">{cameraError}</small>}
+    </div>
+  );
+}
+
+function DamageLossReportControl({ report, busy, saving: parentSaving, onSave }) {
+  const [status, setStatus] = useState(report.resolution_status);
+  const [notes, setNotes] = useState(report.resolution_notes || "");
+  const [isRecovered, setIsRecovered] = useState(Boolean(report.is_recovered));
+  const [saving, setSaving] = useState(false);
+  const [saveFeedback, setSaveFeedback] = useState(null);
+
+  async function submit(event) {
+    event.preventDefault();
+    setSaving(true);
+    setSaveFeedback(null);
+    try {
+      const saved = await onSave(status, notes.trim(), isRecovered);
+      setSaveFeedback(saved
+        ? { type: "success", message: typeof saved === "string" ? saved : "Resolution saved." }
+        : { type: "error", message: "Could not save. Check the page error and try again." });
+    } catch (saveError) {
+      console.error("The damage or loss resolution could not be saved:", saveError);
+      setSaveFeedback({ type: "error", message: "Could not save. Check the page error and try again." });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <article className="admin-request damage-report-row">
+      <div className="admin-request-main">
+        <div className="loan-card-heading"><span className="card-category">{report.asset_code} · {report.report_type}</span><StatusPill value={report.resolution_status} /></div>
+        <h2>{report.equipment_name}</h2>
+        <p>{report.borrower_name} · {report.borrower_email}</p>
+        <small>{report.description} · {report.quantity_affected || 1} affected {Number(report.quantity_affected || 1) === 1 ? "unit" : "units"} · Reported {dateTimeLabel(report.created_at)}</small>
+      </div>
+      <form className="damage-report-resolution" onSubmit={submit}>
+        <label><span>Resolution</span><select value={status} onChange={(event) => { const nextStatus = event.target.value; setStatus(nextStatus); if (nextStatus !== "resolved") setIsRecovered(false); setSaveFeedback(null); }} disabled={busy || saving}>
+          <option value="open">Open</option>
+          <option value="under_review">Under review</option>
+          <option value="resolved">Resolved</option>
+          <option value="waived">Waived</option>
+        </select></label>
+        {report.report_type === "loss" && <label className="checkbox-label">
+          <input type="checkbox" checked={isRecovered} onChange={(event) => { setIsRecovered(event.target.checked); setSaveFeedback(null); }} disabled={busy || saving || status !== "resolved"} />
+          <span>Item physically recovered (required to restore availability)</span>
+        </label>}
+        <label><span>Resolution notes</span><textarea value={notes} onChange={(event) => { setNotes(event.target.value); setSaveFeedback(null); }} maxLength={2000} rows="2" disabled={busy || saving} required={["resolved", "waived"].includes(status)} /></label>
+        <button className="button-secondary" type="submit" disabled={busy || saving || (["resolved", "waived"].includes(status) && !notes.trim())}>{busy || saving || parentSaving ? "Saving…" : "Save resolution"}</button>
+        {saveFeedback && <p className={`feedback feedback-${saveFeedback.type}`} role={saveFeedback.type === "error" ? "alert" : "status"}>{saveFeedback.message}</p>}
+      </form>
+    </article>
+  );
+}
+
+function EquipmentTable({ equipment, onEdit, onDelete }) {
+  if (!equipment.length) return <EmptyState title="No equipment records" copy="Add the first item to start your inventory." />;
+  return (
+    <div className="table-wrap inventory-table">
+      <table><thead><tr><th>Asset</th><th>Category</th><th>Available / total</th><th>Storage</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody>{equipment.map((item) => <tr key={item.id}>
+          <td><div className="inventory-asset">{item.image_url && <img src={item.image_url} alt="" />}<div><strong>{item.name}</strong><small>{item.asset_tag}</small></div></div></td><td>{item.category || "—"}</td><td>{item.available_quantity ?? "—"} / {item.quantity}</td><td>{item.location || "—"}</td><td><StatusPill value={item.quantity === 0 || item.available_quantity === 0 ? "out_of_stock" : item.status} /></td>
+          <td><div className="table-actions">
+            <button type="button" className="button-secondary" onClick={() => onEdit(item)} aria-label={`Edit ${item.name}`}><Pencil size={14} /> Edit</button>
+            <button type="button" className="button-danger" onClick={() => onDelete(item)} aria-label={`Remove ${item.name}`}><Trash2 size={14} /> Delete</button>
+          </div></td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+  );
+}
+
+function EquipmentAuditLog({ entries }) {
+  if (!entries.length) return <EmptyState title="No equipment changes recorded" copy="Equipment additions, edits, and removals will be captured here automatically." />;
+  return (
+    <div className="audit-list">
+      {entries.map((entry) => (
+        <article className="audit-entry" key={entry.id}>
+          <span className={`audit-mark audit-${entry.action}`}><Activity size={16} /></span>
+          <div className="audit-entry-main">
+            <strong>{entry.action === "insert" ? "Equipment added" : entry.action === "delete" ? "Equipment removed" : "Equipment updated"}</strong>
+            <p>{entry.asset_tag} · {entry.changed_fields.join(", ")}</p>
+            <small>{new Date(entry.changed_at).toLocaleString()} · User {entry.actor_id || "unknown"}</small>
+            <details>
+              <summary>Show recorded values</summary>
+              <div className="audit-values">
+                {entry.old_values && <div><b>Before</b><pre>{JSON.stringify(entry.old_values, null, 2)}</pre></div>}
+                {entry.new_values && <div><b>After</b><pre>{JSON.stringify(entry.new_values, null, 2)}</pre></div>}
+              </div>
+            </details>
+          </div>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function AccountSettings({ profile, user, busy, onSave }) {
+  return (
+    <section className="account-panel">
+      <div className="account-panel-heading">
+        <span className="toolbar-icon"><Settings size={18} /></span>
+        <div><h2>Profile information</h2><p>Update the information shown to other workspace members.</p></div>
+      </div>
+      <form className="modal-form account-form" onSubmit={onSave}>
+        <div className="profile-photo-setting">
+          <ProfileAvatar name={profile?.display_name || user.email || "Member"} photoUrl={profile?.profile_photo_url} className="profile-photo-preview" />
+          <div>
+            <label><span>Profile photo</span><input name="profile_photo" type="file" accept="image/jpeg,image/png,image/webp" /><small className="field-hint">JPEG, PNG, or WebP; up to 5 MB. Borrower photos are visible in the admin and custodian equipment workspace.</small></label>
+            {profile?.profile_photo_path && <label className="checkbox-label"><input name="remove_profile_photo" type="checkbox" /><span>Remove current photo when saving</span></label>}
+          </div>
+        </div>
+        <div className="form-row">
+          <label><span>First name</span><input name="first_name" defaultValue={profile?.first_name?.trim() || profile?.display_name?.trim().split(/\s+/)[0] || ""} autoComplete="given-name" required maxLength={60} /></label>
+          <label><span>Last name</span><input name="last_name" defaultValue={profile?.last_name?.trim() || profile?.display_name?.trim().split(/\s+/).slice(1).join(" ") || ""} autoComplete="family-name" required maxLength={60} /></label>
+        </div>
+        <label><span>Email</span><input value={user.email || ""} readOnly /></label>
+        <div className="form-row">
+          <label><span>Department</span><select name="department" defaultValue={profile?.department || ""} required>
+            {!DEPARTMENTS.includes(profile?.department) && profile?.department && <option value={profile.department}>{profile.department}</option>}
+            {!profile?.department && <option value="">Select department</option>}
+            {DEPARTMENTS.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select></label>
+          <label><span>Course</span><input name="course" defaultValue={profile?.course || ""} maxLength={120} placeholder="Your course" required /></label>
+        </div>
+        <label><span>Gender</span><select name="gender" defaultValue={profile?.gender || ""} required><option value="">Select gender</option><option value="Female">Female</option><option value="Male">Male</option><option value="Non-binary">Non-binary</option><option value="Prefer not to say">Prefer not to say</option><option value="Other">Other</option></select></label>
+        <div className="account-form-actions"><span>Your role: <strong>{profile?.role || "member"}</strong></span><button className="button-primary" type="submit" disabled={busy}>{busy ? "Saving…" : "Save account settings"} <Check size={15} /></button></div>
+      </form>
+    </section>
+  );
+}
+
+function CurrentlyBorrowedWorkspace({ rows, categories, loading }) {
+  const [query, setQuery] = useState("");
+  const [status, setStatus] = useState("all");
+  const [selectedCategory, setSelectedCategory] = useState("All equipment");
+  const [activeTable, setActiveTable] = useState("borrowed");
+  if (loading) return <LoadingPanel />;
+  const normalizedQuery = query.trim().toLowerCase();
+  const matchesFilters = (item) => {
+    const matchesStatus = status === "all" || item.record_status === status;
+    const matchesCategory = selectedCategory === "All equipment" || item.category_name === selectedCategory;
+    const matchesSearch = !normalizedQuery || [
+      item.equipment_name,
+      item.asset_code,
+      item.borrower_name,
+      item.department,
+      item.destination,
+      item.storage_location,
+    ].some((value) => value?.toLowerCase().includes(normalizedQuery));
+    return matchesStatus && matchesCategory && matchesSearch;
+  };
+  const borrowedRows = rows.filter((item) => item.record_type === "borrow" && matchesFilters(item));
+  const reservedRows = rows.filter((item) => item.record_type === "reservation" && matchesFilters(item));
+  const summary = [
+    ["released", "Released / on loan"],
+    ["overdue", "Overdue"],
+    ["reserved", "Reserved"],
+  ];
+  const visibleRows = activeTable === "borrowed" ? borrowedRows : reservedRows;
+  const statusCount = (value) => rows.filter((item) => item.record_status === value).length;
+  return (
+    <>
+      <section className="tracking-summary" aria-label="Equipment status summary">
+        {summary.map(([value, label]) => <article key={value} className={`tracking-summary-card tracking-${value}`}><span>{label}</span><strong>{statusCount(value)}</strong></article>)}
+      </section>
+      <div className="toolbar currently-borrowed-toolbar">
+        <label className="search-box"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search equipment, tag, borrower or location" aria-label="Search equipment tracking" /></label>
+        <label className="tracking-filter"><span className="sr-only">Filter by category</span><select value={selectedCategory} onChange={(event) => setSelectedCategory(event.target.value)}><option>All equipment</option>{categories.map((item) => <option key={item.category_id} value={item.category_name}>{item.category_name}</option>)}</select></label>
+        <label className="tracking-filter"><span className="sr-only">Filter by equipment status</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">All statuses</option>{summary.map(([value, label]) => <option key={value} value={value}>{label} ({statusCount(value)})</option>)}</select></label>
+        <span className="filter-caption">{visibleRows.length} records</span>
+      </div>
+      <div className="tracking-table-tabs" role="tablist" aria-label="Equipment tracking tables">
+        <button type="button" role="tab" aria-selected={activeTable === "borrowed"} className={activeTable === "borrowed" ? "active" : ""} onClick={() => setActiveTable("borrowed")}>Released equipment <span>{borrowedRows.length}</span></button>
+        <button type="button" role="tab" aria-selected={activeTable === "reserved"} className={activeTable === "reserved" ? "active" : ""} onClick={() => setActiveTable("reserved")}>Reserved equipment <span>{reservedRows.length}</span></button>
+      </div>
+      {!visibleRows.length ? <EmptyState title={rows.length ? "No matching equipment" : "No tracking records available"} copy={rows.length ? "Try a different search, category, or status filter." : "Equipment inventory, reservations, checkouts, and returns will appear here."} /> : <div className="table-wrap tracking-table-wrap">
+        <table className="tracking-table">
+          <thead><tr><th>Equipment</th><th>Borrower</th><th>Status</th><th>Location of use</th><th>Pickup time</th><th>Return time</th><th>Amount</th></tr></thead>
+          <tbody>{visibleRows.map((item) => (
+            <tr key={item.record_id}>
+              <td><div className="tracking-item"><span className="tracking-item-image">{item.equipment_image_url ? <img src={item.equipment_image_url} alt="" /> : <Package size={18} />}</span><span><strong>{item.equipment_name}</strong><small>{item.asset_code} · {item.category_name}</small></span></div></td>
+              <td>{item.borrower_name ? <div className="tracking-borrower"><ProfileAvatar name={item.borrower_name} photoUrl={item.profile_photo_url} className="borrower-photo" /><span><strong>{item.borrower_name}</strong><small>{item.department || "Department not provided"}</small></span></div> : "—"}</td>
+              <td><StatusPill value={item.record_status} /></td>
+              <td>{item.destination || item.storage_location || "—"}</td>
+              <td>{item.pickup_at ? dateTimeLabel(item.pickup_at) : item.record_type === "reservation" ? dateLabel(item.start_date) : "—"}</td>
+              <td>{item.return_at ? dateTimeLabel(item.return_at) : item.record_type === "reservation" ? dateLabel(item.end_date) : "—"}</td>
+              <td>{item.amount} {item.amount === 1 ? "item" : "items"}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>}
+    </>
+  );
+}
+
+function FeedbackBoard({ threads, currentUserId, isAdmin, canManageFeedback, busy, onCreate, onReply, onDeleteReply, onDeleteThread, onStatusChange }) {
+  const categoryLabels = {
+    issue: "Issue",
+    suggestion: "Suggestion",
+    question: "Question",
+    other: "Other",
+  };
+  const statusLabels = {
+    open: "Open",
+    under_review: "Under review",
+    planned: "Planned",
+    implemented: "Implemented",
+  };
+  return (
+    <div className="feedback-board">
+      <section className="feedback-compose">
+        <div className="feedback-compose-heading"><span className="toolbar-icon"><MessageSquare size={18} /></span><div><h2>Start a conversation</h2><p>Suggest a feature, report an issue, or ask how the system should work in the future.</p></div></div>
+        <form className="feedback-form" onSubmit={onCreate}>
+          <label><span>Topic</span><input name="title" placeholder="A short title for your feedback" maxLength={140} required /></label>
+          <div className="form-row">
+            <label><span>Category</span><select name="category" defaultValue="suggestion"><option value="issue">Issue</option><option value="suggestion">Suggestion</option><option value="question">Question</option></select></label>
+            <label className="feedback-message-label"><span>Your message</span><textarea name="message" placeholder="Share details so members and admins can discuss it…" rows="3" maxLength={4000} required /></label>
+          </div>
+          <div className="feedback-submit-row"><small>Visible to signed-in members and admins.</small><button className="button-primary" type="submit" disabled={busy}>{busy ? "Posting…" : "Post feedback"} <Send size={14} /></button></div>
+        </form>
+      </section>
+
+      <div className="section-title"><div><h2>Community feedback</h2><p>Ideas and updates shared across the equipment community</p></div><span className="record-count">{threads.length} topics</span></div>
+      {!threads.length ? <EmptyState title="Start the first conversation" copy="Your feedback will help members and admins decide what to improve next." /> : (
+        <div className="feedback-thread-list">
+          {threads.map((thread) => (
+            <article className="feedback-thread" key={thread.id}>
+              <header className="feedback-thread-header">
+                <div><span className={`feedback-category category-${thread.category}`}>{categoryLabels[thread.category] || thread.category.replaceAll("_", " ")}</span><span className={`feedback-status status-${thread.status}`}>{statusLabels[thread.status]}</span></div>
+                <div className="feedback-thread-controls">
+                  {canManageFeedback && <label className="feedback-status-control"><span className="sr-only">Update discussion status</span><select value={thread.status} disabled={busy} onChange={(event) => onStatusChange(thread.id, event.target.value)}>{Object.entries(statusLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>}
+                  {isAdmin && <button className="feedback-delete-button" type="button" aria-label={`Delete feedback thread ${thread.title}`} title="Delete thread and replies" disabled={busy} onClick={() => onDeleteThread(thread)}><Trash2 size={14} /></button>}
+                </div>
+              </header>
+              <h3>{thread.title}</h3>
+              <p className="feedback-thread-message">{thread.message}</p>
+              <div className="feedback-byline">Started by {thread.author_name} · {new Date(thread.created_at).toLocaleString()}</div>
+              {!!thread.replies.length && <div className="feedback-replies">{thread.replies.map((reply) => (
+                <div className="feedback-reply" key={reply.id}>
+                  <div><strong>{reply.author_name}{reply.author_id === currentUserId ? " (you)" : ""}</strong><time>{new Date(reply.created_at).toLocaleString()}</time>{isAdmin && <button className="feedback-delete-button" type="button" aria-label={`Delete comment by ${reply.author_name}`} title="Delete comment" disabled={busy} onClick={() => onDeleteReply(reply)}><Trash2 size={14} /></button>}</div>
+                  <p>{reply.message}</p>
+                </div>
+              ))}</div>}
+              <form className="feedback-reply-form" onSubmit={(event) => onReply(event, thread.id)}>
+                <label><span className="sr-only">Reply to {thread.title}</span><textarea name="reply" placeholder="Add a reply to this discussion…" rows="2" maxLength={2000} required /></label>
+                <button className="button-secondary" type="submit" disabled={busy}><Send size={14} /> Reply</button>
+              </form>
+            </article>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MemberTable({ members, currentUserId, busy, runAction, onAnonymize, supabase }) {
+  if (!members.length) return <EmptyState title="No member accounts yet" copy="Accounts will appear here after users sign up and confirm their email." />;
+  const activeAdminCount = members.filter((member) => member.role === "admin" && member.account_status === "active").length;
+  return (
+    <div className="table-wrap inventory-table">
+      <table><thead><tr><th>Member</th><th>Account status</th><th>Role</th><th>Account created</th><th>Account actions</th></tr></thead>
+        <tbody>{members.map((member) => (
+          <tr key={member.id}>
+            <td><strong>{member.display_name || "Unnamed member"}</strong><small>{member.email || "Email not available"}</small></td>
+            <td>{member.account_status || "—"}</td>
+            <td>
+              <select
+                aria-label={`Change role for ${member.display_name || member.email}`}
+                value={member.role}
+                disabled={member.id === currentUserId || member.account_status !== "active"}
+                title={member.account_status === "pending" ? "Approve account access before assigning a role." : undefined}
+                onChange={(event) => runAction(
+                  () => supabase.rpc("set_profile_role", { p_user_id: member.id, p_role: event.target.value }),
+                  "Member role updated.",
+                )}
+              >
+                <option value="staff">Borrower</option>
+                <option value="property_custodian">Property custodian</option>
+                <option value="admin">Administrator</option>
+              </select>
+            </td>
+            <td>{dateLabel(member.created_at?.slice(0, 10))}</td>
+            <td><div className="table-actions">
+              {member.account_status === "active" && member.id !== currentUserId && <button className="button-danger" type="button" disabled={busy || (member.role === "admin" && activeAdminCount <= 1)} title={member.role === "admin" && activeAdminCount <= 1 ? "The last active administrator cannot be deactivated." : undefined} onClick={() => {
+                if (window.confirm(`Deactivate ${member.display_name || member.email}? Their current sessions will be revoked.`)) {
+                  runAction(() => supabase.rpc("admin_deactivate_borrower_account", { p_user_id: member.id }), "Account deactivated.");
+                }
+              }}>Deactivate</button>}
+              {member.account_status === "inactive" && member.role === "staff" && member.email && <button className="button-danger" type="button" disabled={busy} onClick={() => {
+                if (window.prompt(`This permanently anonymizes ${member.display_name || member.email}. Type ANONYMIZE to continue.`) === "ANONYMIZE") onAnonymize(member);
+              }}>Anonymize borrower</button>}
+              {member.account_status === "inactive" && <button className="button-danger" type="button" disabled={busy} onClick={() => {
+                const accountLabel = member.display_name || member.email || "this account";
+                const confirmation = window.prompt(
+                  `Permanently delete ${accountLabel}? Their login and profile will be removed. Borrowing and audit history will be retained in anonymized form; feedback, reservations, notifications, and consent records may be removed. Type DELETE to continue.`,
+                );
+                if (confirmation === "DELETE") {
+                  runAction(async () => {
+                    const response = await fetch("/api/admin/permanently-delete-account", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ userId: member.id }),
+                    });
+                    const result = await response.json();
+                    if (!response.ok) throw new Error(result.error || "Permanent account deletion failed.");
+                    return {
+                      notice: result.warning
+                        || "Account permanently deleted. Borrowing and audit history were retained.",
+                    };
+                  }, "Account permanently deleted.");
+                }
+              }}>Permanently delete</button>}
+            </div></td>
+          </tr>
+        ))}</tbody>
+      </table>
+      <p className="table-note">Your own role cannot be changed here. Ask another administrator if you need to change your access.</p>
+    </div>
+  );
+}
+
+function PendingAccounts({ accounts, busy, runAction, supabase }) {
+  if (!accounts.length) {
+    return <EmptyState title="No accounts awaiting approval" copy="New borrower accounts will appear here after email verification." />;
+  }
+  return (
+    <div className="table-wrap inventory-table">
+      <table>
+        <thead><tr><th>Applicant</th><th>Requested</th><th>Decision</th></tr></thead>
+        <tbody>{accounts.map((account) => (
+          <tr key={account.id}>
+            <td>
+              <strong>{account.full_name || "Unnamed member"}</strong>
+              <small>{account.email || "Email not available"}</small>
+            </td>
+            <td>{dateLabel(account.created_at?.slice(0, 10))}</td>
+            <td>
+              <div className="card-actions">
+                <button
+                  className="button-primary"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => runAction(
+                    () => supabase.rpc("review_borrower_access", {
+                      p_user_id: account.id,
+                      p_decision: "approve",
+                    }),
+                    "Borrower account approved.",
+                  )}
+                >
+                  Approve
+                </button>
+                <button
+                  className="button-danger"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => runAction(
+                    () => supabase.rpc("review_borrower_access", {
+                      p_user_id: account.id,
+                      p_decision: "reject",
+                    }),
+                    "Borrower account rejected.",
+                  )}
+                >
+                  Reject
+                </button>
+              </div>
+            </td>
+          </tr>
+        ))}</tbody>
+      </table>
+      <p className="table-note">Only administrators and property custodians can approve or reject access. Each decision is recorded in the account access audit log.</p>
+    </div>
+  );
+}

@@ -1,0 +1,330 @@
+name: Database tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  database-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Supabase CLI
+        # Replace this tag with an immutable SHA copied from the supabase/setup-cli release page when pinning is required.
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
+
+      - name: Stage migrations in dependency order
+        run: bash .github/scripts/prepare-db-test-project.sh "$RUNNER_TEMP/rmmc-db-tests"
+
+      - name: Start local Supabase
+        run: supabase --workdir "$RUNNER_TEMP/rmmc-db-tests" start
+
+      - name: Reset local database
+        run: supabase --workdir "$RUNNER_TEMP/rmmc-db-tests" db reset
+
+      - name: Show local Supabase status variable names
+        run: |
+          set -euo pipefail
+          status_output="$(supabase --workdir "$RUNNER_TEMP/rmmc-db-tests" status --output env)" || {
+            echo "Failed to read local Supabase status." >&2
+            exit 1
+          }
+          status_keys="$(printf '%s\n' "$status_output" | awk -F= '{ key = $1; sub(/^[[:space:]]*export[[:space:]]+/, "", key); if (key ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print key }' | sort -u)"
+          printf 'Supabase status environment keys (values omitted):\n%s\n' "$status_keys"
+          if ! grep --fixed-strings --line-regexp 'DB_URL' <<< "$status_keys" >/dev/null; then
+            echo "Missing DB_URL in supabase status --output env." >&2
+            exit 1
+          fi
+
+      - name: Create active admin, student, and pending-account fixtures
+        env:
+          SUPABASE_WORKDIR: ${{ runner.temp }}/rmmc-db-tests
+        run: |
+          set -euo pipefail
+          eval "$(supabase --workdir "$SUPABASE_WORKDIR" status --output env)"
+          if [[ -z "${DB_URL:-}" ]]; then
+            echo "Missing DB_URL after evaluating supabase status --output env." >&2
+            exit 1
+          fi
+
+          missing_consent_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --request POST "$API_URL/auth/v1/admin/users" \
+            --header "apikey: $SERVICE_ROLE_KEY" \
+            --header "Authorization: Bearer $SERVICE_ROLE_KEY" \
+            --header "Content-Type: application/json" \
+            --data '{"email":"ci-no-consent@example.com","password":"ci-only-password-123!","email_confirm":true,"user_metadata":{"first_name":"CI","last_name":"No Consent"}}')"
+          if [[ "$missing_consent_status" -lt 400 ]]; then
+            echo "Signup unexpectedly succeeded without privacy consent metadata." >&2
+            exit 1
+          fi
+
+          curl --fail --silent --show-error \
+            --request POST "$API_URL/auth/v1/admin/users" \
+            --header "apikey: $SERVICE_ROLE_KEY" \
+            --header "Authorization: Bearer $SERVICE_ROLE_KEY" \
+            --header "Content-Type: application/json" \
+            --data '{"email":"ci-admin@example.com","password":"ci-only-password-123!","email_confirm":true,"user_metadata":{"first_name":"CI","last_name":"Admin","privacy_consent":"true","privacy_consent_version":"2026-11-03-v1"}}' \
+            >/dev/null
+          curl --fail --silent --show-error \
+            --request POST "$API_URL/auth/v1/admin/users" \
+            --header "apikey: $SERVICE_ROLE_KEY" \
+            --header "Authorization: Bearer $SERVICE_ROLE_KEY" \
+            --header "Content-Type: application/json" \
+            --data '{"email":"ci-custodian@example.com","password":"ci-only-password-123!","email_confirm":true,"user_metadata":{"first_name":"CI","last_name":"Custodian","privacy_consent":"true","privacy_consent_version":"2026-11-03-v1"}}' \
+            >/dev/null
+          curl --fail --silent --show-error \
+            --request POST "$API_URL/auth/v1/admin/users" \
+            --header "apikey: $SERVICE_ROLE_KEY" \
+            --header "Authorization: Bearer $SERVICE_ROLE_KEY" \
+            --header "Content-Type: application/json" \
+            --data '{"email":"ci-student@example.com","password":"ci-only-password-123!","email_confirm":true,"user_metadata":{"first_name":"CI","last_name":"Student","course":"CI","privacy_consent":"true","privacy_consent_version":"2026-11-03-v1"}}' \
+            >/dev/null
+          curl --fail --silent --show-error \
+            --request POST "$API_URL/auth/v1/admin/users" \
+            --header "apikey: $SERVICE_ROLE_KEY" \
+            --header "Authorization: Bearer $SERVICE_ROLE_KEY" \
+            --header "Content-Type: application/json" \
+            --data '{"email":"ci-phase8@example.com","password":"ci-only-password-123!","email_confirm":true,"user_metadata":{"first_name":"CI","last_name":"Phase Eight","privacy_consent":"true","privacy_consent_version":"2026-11-03-v1"}}' \
+            >/dev/null
+
+          psql --set ON_ERROR_STOP=1 "$DB_URL" <<'SQL'
+          update public.profiles
+          set role = 'admin', account_status = 'active'
+          where email = 'ci-admin@example.com';
+
+          update public.profiles
+          set role = 'property_custodian', account_status = 'active'
+          where email = 'ci-custodian@example.com';
+
+          update public.borrowers
+          set status = 'active'
+          where email = 'ci-custodian@example.com'
+            and user_id = (select id from auth.users where email = 'ci-custodian@example.com');
+
+          update public.profiles
+          set role = 'staff', account_status = 'active'
+          where email = 'ci-student@example.com';
+
+          update public.borrowers
+          set status = 'active'
+          where email = 'ci-student@example.com'
+            and user_id = (select id from auth.users where email = 'ci-student@example.com');
+
+          update public.profiles
+          set role = 'staff', account_status = 'active'
+          where email = 'ci-phase8@example.com';
+
+          update public.borrowers
+          set status = 'active'
+          where email = 'ci-phase8@example.com'
+            and user_id = (select id from auth.users where email = 'ci-phase8@example.com');
+
+          insert into public.categories (category_name, description)
+          values ('CI fixture category', 'Created by the database test workflow.')
+          on conflict (category_name) do nothing;
+
+          insert into public.equipment (asset_code, equipment_name, category_id, quantity, availability_status)
+          select 'CI-PHASE8-EQUIPMENT', 'Phase 8 fixture equipment', category_id, 1, 'available'
+          from public.categories where category_name = 'CI fixture category'
+          on conflict (asset_code) do nothing;
+
+          insert into public.borrower_agreement_acceptances (user_id, version_id)
+          select u.id, v.version_id
+          from auth.users u
+          cross join lateral (
+            select version_id
+            from public.borrower_agreement_versions
+            where active
+            order by version_number desc
+            limit 1
+          ) v
+          where u.email = 'ci-student@example.com'
+          on conflict (user_id, version_id) do nothing;
+
+          do $$
+          begin
+            if not exists (
+              select 1 from public.profiles
+              where email = 'ci-admin@example.com'
+                and role = 'admin' and account_status = 'active'
+            ) then
+              raise exception 'Failed to create the active admin fixture.';
+            end if;
+            if not exists (
+              select 1
+              from public.borrowers b
+              join public.profiles p on p.id = b.user_id
+              where b.email = 'ci-student@example.com'
+                and b.status = 'active'
+                and p.role = 'staff'
+                and p.account_status = 'active'
+            ) then
+              raise exception 'Failed to create the active student fixture.';
+            end if;
+            if not exists (
+              select 1
+              from public.profiles p
+              join auth.users u on u.id = p.id
+              join public.borrowers b on b.user_id = p.id
+              where p.email = 'ci-custodian@example.com'
+                and p.role = 'property_custodian' and p.account_status = 'active'
+                and b.status = 'active' and u.email_confirmed_at is not null
+            ) then
+              raise exception 'Failed to create the active, email-confirmed property custodian fixture with linked borrower.';
+            end if;
+            if not exists (
+              select 1
+              from public.profiles p
+              join auth.users u on u.id = p.id
+              join public.borrowers b on b.user_id = p.id
+              where p.email = 'ci-phase8@example.com'
+                and p.role = 'staff' and p.account_status = 'active'
+                and b.status = 'active' and u.email_confirmed_at is not null
+            ) then
+              raise exception 'Failed to create the active, email-confirmed Phase 8 borrower fixture.';
+            end if;
+            if not exists (
+              select 1 from public.equipment e
+              join public.categories c using (category_id)
+              where e.asset_code = 'CI-PHASE8-EQUIPMENT'
+                and c.category_name = 'CI fixture category'
+            ) then
+              raise exception 'Failed to create the Phase 8 equipment and category fixtures.';
+            end if;
+          end;
+          $$;
+          SQL
+
+          curl --fail --silent --show-error \
+            --request POST "$API_URL/auth/v1/token?grant_type=password" \
+            --header "apikey: $ANON_KEY" \
+            --header "Content-Type: application/json" \
+            --data '{"email":"ci-phase8@example.com","password":"ci-only-password-123!"}' \
+            >/dev/null
+
+          curl --fail --silent --show-error \
+            --request POST "$API_URL/auth/v1/admin/users" \
+            --header "apikey: $SERVICE_ROLE_KEY" \
+            --header "Authorization: Bearer $SERVICE_ROLE_KEY" \
+            --header "Content-Type: application/json" \
+            --data '{"email":"ci-pending@example.com","password":"ci-only-password-123!","email_confirm":true,"user_metadata":{"first_name":"CI","last_name":"Pending","course":"CI","privacy_consent":"true","privacy_consent_version":"2026-11-03-v1"}}' \
+            >/dev/null
+
+      - name: Run every SQL test
+        env:
+          SUPABASE_WORKDIR: ${{ runner.temp }}/rmmc-db-tests
+        run: |
+          set -uo pipefail
+          status_output="$(supabase --workdir "$SUPABASE_WORKDIR" status --output env)" || {
+            echo "Failed to read local Supabase status." >&2
+            exit 1
+          }
+          status_keys="$(printf '%s\n' "$status_output" | awk -F= '{ key = $1; sub(/^[[:space:]]*export[[:space:]]+/, "", key); if (key ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print key }')"
+          if ! grep --fixed-strings --line-regexp 'DB_URL' <<< "$status_keys" >/dev/null; then
+            echo "Missing DB_URL in supabase status --output env." >&2
+            exit 1
+          fi
+          eval "$status_output"
+          if [[ -z "${DB_URL:-}" ]]; then
+            echo "Missing DB_URL after evaluating supabase status --output env." >&2
+            exit 1
+          fi
+          dblink_connection='host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres'
+          if [[ -z "$dblink_connection" ]]; then
+            echo "Missing DBLINK_CONNECTION for the local concurrency database." >&2
+            exit 1
+          fi
+
+          shopt -s nullglob
+          tests=(supabase/tests/*.sql)
+          if (( ${#tests[@]} == 0 )); then
+            echo "No SQL tests found in supabase/tests/." >&2
+            exit 1
+          fi
+          failed_files=()
+          failed_statuses=()
+          failed_errors=()
+          for test_file in "${tests[@]}"; do
+            echo "Running $test_file"
+            test_log="$RUNNER_TEMP/$(basename "$test_file").log"
+            if psql --set ON_ERROR_STOP=1 --set race_barrier=off \
+              --set dblink_connection="$dblink_connection" \
+              --file "$test_file" "$DB_URL" >"$test_log" 2>&1; then
+              echo "PASS: $test_file"
+            else
+              test_status=$?
+              first_error="$(grep -m 1 -E 'ERROR:|FATAL:|PANIC:|psql:' "$test_log" || head -n 1 "$test_log")"
+              failed_files+=("$test_file")
+              failed_statuses+=("$test_status")
+              failed_errors+=("$first_error")
+              echo "FAIL: $test_file (exit $test_status): $first_error"
+              cat "$test_log"
+            fi
+          done
+
+          echo "SQL test summary: ${#tests[@]} files, $((${#tests[@]} - ${#failed_files[@]})) passed, ${#failed_files[@]} failed."
+          if (( ${#failed_files[@]} > 0 )); then
+            for index in "${!failed_files[@]}"; do
+              printf 'FAIL: %s (exit %s): %s\n' \
+                "${failed_files[$index]}" "${failed_statuses[$index]}" "${failed_errors[$index]}"
+            done
+            exit 1
+          fi
+
+      - name: Prove the concurrency test catches a missing lock
+        env:
+          SUPABASE_WORKDIR: ${{ runner.temp }}/rmmc-db-tests
+        run: |
+          set -euo pipefail
+          status_output="$(supabase --workdir "$SUPABASE_WORKDIR" status --output env)" || {
+            echo "Failed to read local Supabase status." >&2
+            exit 1
+          }
+          status_keys="$(printf '%s\n' "$status_output" | awk -F= '{ key = $1; sub(/^[[:space:]]*export[[:space:]]+/, "", key); if (key ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print key }')"
+          if ! grep --fixed-strings --line-regexp 'DB_URL' <<< "$status_keys" >/dev/null; then
+            echo "Missing DB_URL in supabase status --output env." >&2
+            exit 1
+          fi
+          eval "$status_output"
+          if [[ -z "${DB_URL:-}" ]]; then
+            echo "Missing DB_URL after evaluating supabase status --output env." >&2
+            exit 1
+          fi
+          dblink_connection='host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres'
+          if [[ -z "$dblink_connection" ]]; then
+            echo "Missing DBLINK_CONNECTION for the local concurrency database." >&2
+            exit 1
+          fi
+          psql --set ON_ERROR_STOP=1 \
+            --file .github/scripts/remove-approval-equipment-lock.sql "$DB_URL"
+
+          mutation_log="$RUNNER_TEMP/concurrency-lock-mutation.log"
+          if psql --set ON_ERROR_STOP=1 --set race_barrier=on \
+            --set dblink_connection="$dblink_connection" \
+            --file supabase/tests/request_integrity_concurrency.sql "$DB_URL" \
+            >"$mutation_log" 2>&1; then
+            cat "$mutation_log"
+            echo "Concurrency test unexpectedly passed without the equipment row lock." >&2
+            exit 1
+          fi
+
+          if ! grep --fixed-strings \
+            "got 2 successes, 2 approved, 0 requested." "$mutation_log" >/dev/null; then
+            cat "$mutation_log"
+            echo "Concurrency test failed for a reason other than the expected oversubscription." >&2
+            exit 1
+          fi
+          echo "PASS: removing the approval lock makes the concurrency test detect oversubscription."
