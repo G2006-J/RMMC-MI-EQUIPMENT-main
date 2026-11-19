@@ -1279,7 +1279,12 @@ export default function Home() {
         result = { error: reportError };
       }
       if (result?.error) {
-        console.error("The borrower damage/loss report request returned an error:", result.error);
+        console.error("The borrower damage/loss report request returned an error:", {
+          code: result.error.code,
+          message: result.error.message,
+          details: result.error.details,
+          hint: result.error.hint,
+        });
         if (photoPath && !rpcResponseUncertain) {
           const { error: cleanupError } = await supabase.storage
             .from("item-condition-photos")
