@@ -41,6 +41,7 @@ import { DEPARTMENTS } from "@/lib/departments.mjs";
 import { formatManilaDate, formatManilaDateTime } from "@/lib/datetime.mjs";
 import InstallAppButton from "./install-app-button";
 import { AuditLogWorkspace, OverviewReportCards, OverviewStatistics, ReportsWorkspace } from "./phase7-workspaces";
+import { getErrorMessage, PENDING_BORROWER_MESSAGE } from "@/lib/backend-error.mjs";
 
 const MEMBER_NAV_ITEMS = [
   { id: "equipment", label: "Equipment", icon: Package },
@@ -78,8 +79,6 @@ const ADMIN_ITEMS = [
 
 const ACTIVE_BORROWING = ["requested", "approved", "released", "overdue", "return_requested"];
 const PRIVACY_NOTICE_VERSION = "2026-11-03-v1";
-const PENDING_BORROWER_MESSAGE = "No active borrower record is linked to your account. An administrator or property custodian must approve your borrower access before you can submit or view borrowing requests.";
-
 const dateLabel = (value) =>
   value ? formatManilaDate(value) : "—";
 
@@ -143,26 +142,6 @@ function ProfileAvatar({ name, photoUrl, className = "avatar" }) {
     </span>
   );
 }
-
-const getErrorMessage = (error) => {
-  const message = error?.message || "Something went wrong. Please try again.";
-  if (/Your borrower account is pending approval or inactive|No active borrower record matches your signed-in email/i.test(message)) {
-    console.error("A borrower request was blocked by account access:", error);
-    return PENDING_BORROWER_MESSAGE;
-  }
-  if (/email rate limit exceeded|too many requests/i.test(message)) {
-    return "Email delivery is temporarily limited. Please try again later.";
-  }
-  if (/error sending confirmation email|error sending.*email/i.test(message)) {
-    return "The confirmation email could not be sent. Please try again later.";
-  }
-  if (error?.details || error?.hint || /^[0-9A-Z]{5}$/i.test(error?.code || "")
-    || /permission denied|violates .*constraint|row-level security|relation .* does not exist|column .* does not exist|schema cache|could not find the .* function|function .* does not exist|sqlstate|postgres|database error|failed to fetch|fetch failed|pgrst/i.test(message)) {
-    console.error("A backend operation failed:", error);
-    return "The action could not be completed. Please try again.";
-  }
-  return message;
-};
 
 function StatusPill({ value }) {
   const labels = {
