@@ -57,18 +57,31 @@ async function loadReport(supabase, reportId, startDate, endDate, page = 0, expo
         && (!startDate || reportDate >= startDate)
         && (!endDate || reportDate <= endDate);
     });
-    const headers = ["Reported at", "Asset code", "Equipment", "Borrower", "Email", "Affected quantity", "Borrower comment", "Resolution status", "Resolution notes"];
-    const allRows = filteredRows.map((report) => [
-      formatManilaDateTime(report.created_at),
-      report.asset_code || "—",
-      report.equipment_name || "—",
-      report.borrower_name || "—",
-      report.borrower_email || "—",
-      Number(report.quantity_affected || 1),
-      report.description || "No comment recorded",
-      String(report.resolution_status || "open").replaceAll("_", " "),
-      report.resolution_notes || "—",
-    ]);
+    const headers = ["Reported at", "Asset code", "Equipment", "Borrower", "Email", "Quantity", "Borrower comment", "Photo"];
+    const allRows = await Promise.all(filteredRows.map(async (report) => {
+      let photo = "—";
+      if (report.photo_path) {
+        if (exportReport) {
+          photo = "Photo attached";
+        } else {
+          const { data: photoResult, error: photoError } = await supabase.storage
+            .from("item-condition-photos")
+            .createSignedUrl(report.photo_path, 3600);
+          if (photoError) throw photoError;
+          photo = photoResult?.signedUrl || "Photo unavailable";
+        }
+      }
+      return [
+        formatManilaDateTime(report.created_at),
+        report.asset_code || "—",
+        report.equipment_name || "—",
+        report.borrower_name || "—",
+        report.borrower_email || "—",
+        Number(report.quantity_affected || 1),
+        report.description || "No comment recorded",
+        photo,
+      ];
+    }));
     const pageSize = 100;
     const pageRows = exportReport
       ? allRows.slice(0, 5000)
@@ -430,7 +443,9 @@ export function ReportsWorkspace({ supabase, initialReportId = "utilization" }) 
                 <tbody>{rows.map((row, rowIndex) => <tr key={`${report.id}-${rowIndex}`}>
                   {row.map((value, valueIndex) => <td key={`${rowIndex}-${valueIndex}`}>{report.id === "utilization" && valueIndex === 4
                     ? `${(Number(value || 0) * 100).toFixed(1)}%`
-                    : value ?? "—"}</td>)}
+                    : (report.id === "damage" || report.id === "loss") && valueIndex === 7 && typeof value === "string" && value.startsWith("https://")
+                      ? <a href={value} target="_blank" rel="noreferrer">View photo</a>
+                      : value ?? "—"}</td>)}
                   {report.id === "most_borrowed" && <td><span className="report-bar-track"><span style={{ width: `${Math.max(3, (Number(row[2] || 0) / maxBorrowings) * 100)}%` }} /></span></td>}
                 </tr>)}</tbody>
               </table></div>}

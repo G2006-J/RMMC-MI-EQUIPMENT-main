@@ -437,15 +437,16 @@ begin
     or v_damage_notifications_after - v_damage_notifications_before <> 1 then
     raise exception 'Creating a damage report must create exactly one notification for its borrower.';
   end if;
-  update public.damage_loss_reports
-  set resolution_status = 'under_review'
-  where report_id = v_damage_report_id;
-  select count(*) into v_damage_notifications_after
-  from public.notifications
-  where user_id = v_borrower_user and borrowing_id = v_damage_borrowing_id
-    and notification_type = 'damage_report_updated';
-  if v_damage_notifications_after - v_damage_notifications_before <> 2 then
-    raise exception 'Changing a damage report status must create exactly one additional notification.';
+  if has_function_privilege(
+    'authenticated',
+    'public.resolve_damage_loss_report(bigint,text,text)',
+    'execute'
+  ) or has_function_privilege(
+    'authenticated',
+    'public.resolve_damage_loss_report(bigint,text,text,boolean)',
+    'execute'
+  ) then
+    raise exception 'Authenticated users can still resolve damage or loss reports.';
   end if;
 
   v_due_borrowing_id := public.request_equipment_borrowing(
@@ -514,6 +515,9 @@ begin
   );
   perform set_config('test.manager_notification_id', v_manager_notification_id::text, true);
   perform set_config('test.own_notification_id', v_own_notification_id::text, true);
+  perform set_config('test.manager_id', v_manager::text, true);
+  perform set_config('test.borrower_user_id', v_borrower_user::text, true);
+  perform set_config('test.borrower_email', v_borrower_email, true);
 
   if has_function_privilege('anon', 'public.mark_notification_read(bigint)', 'execute')
     or has_function_privilege('anon', 'public.mark_all_notifications_read()', 'execute')
@@ -556,10 +560,14 @@ $$;
 set local role authenticated;
 do $$
 declare
+  v_manager uuid := current_setting('test.manager_id')::uuid;
+  v_borrower_user uuid := current_setting('test.borrower_user_id')::uuid;
+  v_borrower_email text := current_setting('test.borrower_email');
   v_manager_notification_id bigint := current_setting('test.manager_notification_id')::bigint;
   v_own_notification_id bigint := current_setting('test.own_notification_id')::bigint;
   v_denied boolean;
   v_marked integer;
+  v_manager_notification_read boolean;
 begin
   if exists (
     select 1 from public.notifications
@@ -606,15 +614,21 @@ begin
     raise exception 'A client can delete notifications.';
   end if;
 
-  v_denied := false;
-  begin
-    perform public.mark_notification_read(v_manager_notification_id);
-  exception when others then
-    v_denied := sqlerrm = 'Notification not found.';
-  end;
-  if not v_denied then
+  perform public.mark_notification_read(v_manager_notification_id);
+  perform set_config('request.jwt.claim.sub', v_manager::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object('sub', v_manager)::text, true);
+  select is_read into v_manager_notification_read
+  from public.notifications where notification_id = v_manager_notification_id;
+  if v_manager_notification_read is distinct from false then
     raise exception 'A borrower can mark another user''s notification as read.';
   end if;
+  perform set_config('request.jwt.claim.sub', v_borrower_user::text, true);
+  perform set_config(
+    'request.jwt.claims',
+    jsonb_build_object('sub', v_borrower_user, 'email', v_borrower_email)::text,
+    true
+  );
+  perform public.mark_notification_read(-1);
   perform public.mark_notification_read(v_own_notification_id);
   if not exists (
     select 1 from public.notifications

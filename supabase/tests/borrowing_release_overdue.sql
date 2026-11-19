@@ -420,6 +420,8 @@ begin
     raise exception 'A borrowing item status update must write exactly one correctly identified item audit row.';
   end if;
 
+  select coalesce(max(audit_id), 0) into v_audit_start_id
+  from public.borrowing_workflow_audit;
   insert into public.damage_loss_reports (
     borrowing_item_id, reporter_id, report_type, description
   )
@@ -427,11 +429,6 @@ begin
     v_audit_item_id, v_manager, 'damage', 'Audit trigger damage test'
   )
   returning report_id into v_audit_damage_report_id;
-  select coalesce(max(audit_id), 0) into v_audit_start_id
-  from public.borrowing_workflow_audit;
-  update public.damage_loss_reports
-  set resolution_status = 'under_review'
-  where report_id = v_audit_damage_report_id;
   select count(*) into v_audit_count
   from public.borrowing_workflow_audit
   where audit_id > v_audit_start_id;
@@ -442,8 +439,9 @@ begin
       and borrowing_item_id = v_audit_item_id
       and damage_report_id = v_audit_damage_report_id
       and entity_type = 'damage_report'
+      and event_type = 'report_submitted'
   ) then
-    raise exception 'A damage report status update must write exactly one correctly identified damage report audit row.';
+    raise exception 'A damage report submission must write exactly one correctly identified audit row.';
   end if;
 
   if not exists (
@@ -707,25 +705,20 @@ begin
     where borrowing_item_id = v_borrowing_item_id
       and report_type = 'damage'
       and description = 'Test damage report description'
-      and resolution_status = 'open'
   ) then
-    raise exception 'Damaged returns must create an open damage report.';
+    raise exception 'Damaged returns must create a damage report.';
   end if;
 
-  perform public.resolve_damage_loss_report(
-    (select report_id from public.damage_loss_reports where borrowing_item_id = v_borrowing_item_id),
-    'resolved',
-    'Test resolution'
-  );
-
-  if not exists (
-    select 1 from public.damage_loss_reports
-    where borrowing_item_id = v_borrowing_item_id
-      and resolution_status = 'resolved'
-      and resolved_by = v_manager
-      and resolved_at is not null
+  if has_function_privilege(
+    'authenticated',
+    'public.resolve_damage_loss_report(bigint,text,text)',
+    'execute'
+  ) or has_function_privilege(
+    'authenticated',
+    'public.resolve_damage_loss_report(bigint,text,text,boolean)',
+    'execute'
   ) then
-    raise exception 'Damage report resolution must record the resolving manager and timestamp.';
+    raise exception 'Damage and loss report resolution must be disabled.';
   end if;
 
   select count(*) into v_audit_count
@@ -733,8 +726,8 @@ begin
   where borrowing_id = v_borrowing_id
     and entity_type = 'damage_report'
     and event_type = 'status_changed';
-  if v_audit_count < 2 then
-    raise exception 'Damage report creation and resolution status changes must be audited.';
+  if v_audit_count <> 0 then
+    raise exception 'Damage and loss reports must not record resolution-status changes.';
   end if;
 
   select count(*) into v_audit_count
@@ -818,9 +811,8 @@ begin
     where borrowing_item_id = v_lost_item_id
       and report_type = 'loss'
       and description = 'Test lost equipment'
-      and resolution_status = 'open'
   ) then
-    raise exception 'Lost returns must create an open loss report.';
+    raise exception 'Lost returns must create a loss report.';
   end if;
 end;
 $$;

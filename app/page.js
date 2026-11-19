@@ -38,7 +38,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createClient as createAuthClient } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/client";
 import { DEPARTMENTS } from "@/lib/departments.mjs";
-import { getBorrowerActivityItems } from "@/lib/borrower-activity.mjs";
 import { displayEquipmentCategory, isHiddenEquipmentCategory } from "@/lib/equipment-categories.mjs";
 import {
   formatManilaDate,
@@ -62,7 +61,8 @@ const ADMIN_NAV_ITEMS = [
   { id: "equipment", label: "Equipment", icon: Package },
   { id: "currently-borrowed", label: "Equipment tracking", icon: ArrowLeftRight },
   { id: "reports", label: "Reports", icon: FileBarChart },
-  { id: "audit-log", label: "Audit log", icon: Activity },
+  { id: "requests", label: "Manage requests", icon: ClipboardList },
+  { id: "pending-accounts", label: "Pending accounts", icon: ShieldCheck },
   { id: "feedback", label: "Feedback", icon: MessageSquare },
   { id: "account", label: "Account settings", icon: Settings },
 ];
@@ -79,8 +79,7 @@ const CUSTODIAN_NAV_ITEMS = [
 ];
 
 const ADMIN_ITEMS = [
-  { id: "requests", label: "Manage requests", icon: ClipboardList },
-  { id: "pending-accounts", label: "Pending accounts", icon: ShieldCheck },
+  { id: "audit-log", label: "Audit log", icon: Activity },
   { id: "members", label: "Members & roles", icon: UsersRound },
 ];
 
@@ -171,6 +170,7 @@ function StatusPill({ value }) {
     cancelled: "Cancelled",
     fulfilled: "Fulfilled",
     expired: "Expired",
+    pickup_delayed: "Pickup delayed",
   };
   return <span className={`pill pill-${value}`}>{labels[value] || value?.replaceAll("_", " ")}</span>;
 }
@@ -531,7 +531,7 @@ function EquipmentCard({ item, onBorrow, onReserve, canRequest = true }) {
   const categoryLabel = displayEquipmentCategory(item.category);
   return (
     <article className="equipment-card">
-      <div className={`equipment-art art-${(categoryLabel || "equipment").toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}>
+      <div className={`equipment-art ${item.image_url ? "equipment-art-photo" : ""} art-${(categoryLabel || "equipment").toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}>
         {item.image_url ? <img src={item.image_url} alt="" /> : <Laptop size={42} strokeWidth={1.2} />}
         <StatusPill value={item.quantity === 0 || item.available_quantity === 0 ? "out_of_stock" : item.status} />
       </div>
@@ -585,6 +585,9 @@ export default function Home() {
   const [recoveryMode, setRecoveryMode] = useState(false);
   const [view, setView] = useState("overview");
   const [selectedReport, setSelectedReport] = useState("utilization");
+  const [reportBorrowingItemId, setReportBorrowingItemId] = useState(null);
+  const [reportSubmissionComplete, setReportSubmissionComplete] = useState(false);
+  const previousViewRef = useRef("overview");
   const [search, setSearch] = useState("");
   const [searchShortcut, setSearchShortcut] = useState("Ctrl K");
   const searchInputRef = useRef(null);
@@ -606,6 +609,29 @@ export default function Home() {
       setLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const itemId = url.searchParams.get("borrowing_item_id");
+    if (url.searchParams.get("view") === "reports" && itemId && /^\d+$/.test(itemId)) {
+      setReportBorrowingItemId(itemId);
+      setView("reports");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (previousViewRef.current === "reports" && view !== "reports") {
+      const url = new URL(window.location.href);
+      if (url.searchParams.get("view") === "reports") {
+        url.searchParams.delete("view");
+        url.searchParams.delete("borrowing_item_id");
+        window.history.replaceState(window.history.state, "", url);
+      }
+      setReportBorrowingItemId(null);
+      setReportSubmissionComplete(false);
+    }
+    previousViewRef.current = view;
+  }, [view]);
 
   const loadData = useCallback(async (client, currentUser) => {
     if (!client || !currentUser) return;
@@ -712,7 +738,7 @@ export default function Home() {
     }
 
     let borrowingQuery = client.from("borrowings")
-      .select("*, borrowers!inner(borrower_id, first_name, middle_name, last_name, email, department), borrowing_items(borrowing_item_id, borrowing_id, equipment_id, item_status, issued_at, returned_at, quantity, released_by, released_at, received_by, condition_at_release, release_photo_path, condition_at_return, return_photo_path, is_overdue, overdue_at, damage_loss_reports(quantity_affected, report_type), equipment(equipment_id, asset_code, equipment_name, category_id, storage_location, availability_status, tracking_mode, categories(category_name)))")
+      .select("*, borrowers!inner(borrower_id, first_name, middle_name, last_name, email, department), borrowing_items(borrowing_item_id, borrowing_id, equipment_id, item_status, issued_at, returned_at, quantity, released_by, released_at, received_by, condition_at_release, release_photo_path, condition_at_return, return_photo_path, is_overdue, overdue_at, damage_loss_reports(quantity_affected, quantity_deducted), equipment(equipment_id, asset_code, equipment_name, category_id, storage_location, availability_status, tracking_mode, categories(category_name)))")
       .order("created_at", { ascending: false }).order("borrowing_id", { ascending: false }).range(borrowingsPage * 20, borrowingsPage * 20 + 19);
     const safeBorrowingSearch = borrowingsSearch.trim().replace(/[\\%,()"]/g, "\\$&");
     if (safeBorrowingSearch) {
@@ -740,7 +766,6 @@ export default function Home() {
 
     const [
       equipmentResult,
-      reportedQuantitiesResult,
       categoryResult,
       borrowingResult,
       borrowerResult,
@@ -760,7 +785,6 @@ export default function Home() {
         p_after_name: equipmentPageCursors[equipmentPageIndex]?.equipment_name || null,
         p_after_id: equipmentPageCursors[equipmentPageIndex]?.equipment_id || null,
       }),
-      client.rpc("equipment_reported_quantities"),
       client.from("categories").select("category_id, category_name").order("category_name"),
       scopedBorrowingQuery,
       isEquipmentManager ? Promise.resolve({ data: null, error: null }) : client.rpc("current_borrower_id"),
@@ -787,11 +811,6 @@ export default function Home() {
 
     const errors = [];
     let borrowerMissing = false;
-    if (reportedQuantitiesResult.error) {
-      errors.push(["Reported equipment quantities could not be loaded:", reportedQuantitiesResult.error]);
-    }
-    const reportedQuantitiesByEquipment = new Map((reportedQuantitiesResult.data || [])
-      .map((item) => [Number(item.equipment_id), Number(item.reported_quantity || 0)]));
     if (notificationsResult.error) {
       errors.push(["Notifications could not be loaded:", notificationsResult.error]);
       setNotifications([]);
@@ -867,10 +886,6 @@ export default function Home() {
         status: item.availability_status === "borrowed" ? "checked_out" : item.availability_status,
         image_url: item.image_url || null,
         quantity: item.quantity ?? 1,
-        effective_quantity: Math.max(
-          0,
-          Number(item.quantity ?? 1) - (reportedQuantitiesByEquipment.get(Number(item.equipment_id)) || 0),
-        ),
         available_quantity: item.available_quantity ?? null,
       })));
     }
@@ -898,11 +913,30 @@ export default function Home() {
       const openReturnIds = new Set((returnRequestsResult.data || []).filter((item) => item.status === "pending").map((item) => item.borrowing_id));
       setBorrowings((borrowingResult.data || []).map((item) => {
         const borrower = item.borrowers;
-        const firstItem = item.borrowing_items?.[0];
+        const borrowingItems = item.borrowing_items || [];
+        const currentItems = !isEquipmentManager && item.transaction_status === "released"
+          ? borrowingItems
+            .filter((borrowingItem) => borrowingItem.item_status === "released")
+            .map((borrowingItem) => {
+              const quantity = Number(borrowingItem.quantity || 1);
+              const reportedQuantity = (borrowingItem.damage_loss_reports || [])
+                .filter((report) => report.quantity_deducted)
+                .reduce((total, report) => total + Number(report.quantity_affected || 0), 0);
+              return {
+                ...borrowingItem,
+                original_quantity: quantity,
+                quantity: Math.max(0, quantity - reportedQuantity),
+                hasDamageLossReport: (borrowingItem.damage_loss_reports || []).length > 0,
+              };
+            })
+            .filter((borrowingItem) => borrowingItem.quantity > 0)
+          : borrowingItems;
+        if (!isEquipmentManager && item.transaction_status === "released" && currentItems.length === 0) return null;
+        const firstItem = currentItems[0];
         const equipmentItem = firstItem?.equipment;
-        const equipmentNames = (item.borrowing_items || []).map((borrowingItem) => borrowingItem.equipment?.equipment_name).filter(Boolean);
-        const assetCodes = (item.borrowing_items || []).map((borrowingItem) => borrowingItem.equipment?.asset_code).filter(Boolean);
-        const isOverdue = (item.borrowing_items || []).some((borrowingItem) => borrowingItem.is_overdue);
+        const equipmentNames = currentItems.map((borrowingItem) => borrowingItem.equipment?.equipment_name).filter(Boolean);
+        const assetCodes = currentItems.map((borrowingItem) => borrowingItem.equipment?.asset_code).filter(Boolean);
+        const isOverdue = currentItems.some((borrowingItem) => borrowingItem.is_overdue);
         const status = item.transaction_status === "released" && openReturnIds.has(item.borrowing_id)
           ? "return_requested"
           : isOverdue
@@ -910,6 +944,7 @@ export default function Home() {
             : item.transaction_status;
         return {
           ...item,
+          borrowing_items: currentItems,
           id: item.borrowing_id,
           borrower_name: [borrower?.first_name, borrower?.middle_name, borrower?.last_name].filter(Boolean).join(" ") || "Borrower",
           borrower_email: borrower?.email || "",
@@ -926,9 +961,9 @@ export default function Home() {
             asset_tag: assetCodes.join(", "),
             category: displayEquipmentCategory(equipmentItem.categories?.category_name),
           } : null,
-          equipment_items: (item.borrowing_items || []).map((borrowingItem) => borrowingItem.equipment?.equipment_name).filter(Boolean),
-          quantity: (item.borrowing_items || []).reduce((total, borrowingItem) => total + Number(borrowingItem.quantity || 1), 0),
-          unit_items: (item.borrowing_items || [])
+          equipment_items: currentItems.map((borrowingItem) => borrowingItem.equipment?.equipment_name).filter(Boolean),
+          quantity: currentItems.reduce((total, borrowingItem) => total + Number(borrowingItem.quantity || 1), 0),
+          unit_items: currentItems
             .filter((borrowingItem) => borrowingItem.equipment?.tracking_mode === "unit")
             .map((borrowingItem) => ({
               borrowing_item_id: borrowingItem.borrowing_item_id,
@@ -936,7 +971,7 @@ export default function Home() {
               item_status: borrowingItem.item_status,
               quantity: borrowingItem.quantity,
             })),
-          quantity_items: (item.borrowing_items || [])
+          quantity_items: currentItems
             .filter((borrowingItem) => borrowingItem.equipment?.tracking_mode !== "unit")
             .map((borrowingItem) => ({
               borrowing_item_id: borrowingItem.borrowing_item_id,
@@ -945,7 +980,7 @@ export default function Home() {
               quantity: borrowingItem.quantity,
             })),
         };
-      }));
+      }).filter(Boolean));
     }
     if (reservationResult.error) errors.push(["Reservations could not be loaded:", reservationResult.error]);
     else setReservations((reservationResult.data || []).map((item) => ({
@@ -1115,7 +1150,7 @@ export default function Home() {
       ? ["overview", "equipment", "currently-borrowed", "reports", "audit-log", "feedback", "requests", "pending-accounts", "members", "account"]
       : isPropertyCustodian
         ? ["overview", "equipment", "currently-borrowed", "reports", "requests", "pending-accounts", "feedback", "account"]
-        : ["equipment", "loans", "feedback", "account"];
+        : ["equipment", "loans", "reports", "feedback", "account"];
     if (!allowedViews.includes(view)) setView(isAdmin || isPropertyCustodian ? "overview" : "equipment");
   }, [profile, isAdmin, isPropertyCustodian, view]);
 
@@ -1202,6 +1237,83 @@ export default function Home() {
     }
   }
 
+  function openBorrowerDamageReport(borrowingItem) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", "reports");
+    url.searchParams.set("borrowing_item_id", String(borrowingItem.borrowing_item_id));
+    window.history.replaceState(window.history.state, "", url);
+    setReportBorrowingItemId(String(borrowingItem.borrowing_item_id));
+    setReportSubmissionComplete(false);
+    setView("reports");
+  }
+
+  async function submitBorrowerDamageReport(borrowingItem, reportType, description, photoFile) {
+    const quantity = Number(borrowingItem.original_quantity || borrowingItem.quantity || 1);
+    const completed = await runAction(async () => {
+      let photoPath = null;
+      if (photoFile) {
+        try {
+          photoPath = await uploadItemConditionPhoto(supabase, user.id, photoFile, "report photo");
+        } catch (photoError) {
+          console.error("The borrower report photo could not be uploaded:", photoError);
+          const validationMessage = photoError instanceof Error
+            && /JPEG|PNG|WebP|5 MB|valid image|processed/i.test(photoError.message)
+            ? photoError.message
+            : "";
+          throw new Error(validationMessage || "The photo could not be uploaded. Try again or continue without a photo.");
+        }
+      }
+
+      let result;
+      let rpcResponseUncertain = false;
+      try {
+        result = await supabase.rpc("report_borrowing_item_condition_with_photo", {
+          p_borrowing_item_id: borrowingItem.borrowing_item_id,
+          p_report_type: reportType,
+          p_description: description,
+          p_quantity_affected: quantity,
+          p_photo_path: photoPath,
+        });
+      } catch (reportError) {
+        rpcResponseUncertain = true;
+        result = { error: reportError };
+      }
+      if (result?.error) {
+        console.error("The borrower damage/loss report request returned an error:", result.error);
+        if (photoPath && !rpcResponseUncertain) {
+          const { error: cleanupError } = await supabase.storage
+            .from("item-condition-photos")
+            .remove([photoPath]);
+          if (cleanupError) {
+            console.error("The failed borrower report photo could not be removed:", cleanupError);
+            throw new Error("The report could not be saved and its photo could not be removed. Contact a property custodian.");
+          }
+        }
+        if (rpcResponseUncertain) {
+          throw new Error("We couldn't confirm whether your report was sent. Refresh My equipment before trying again.");
+        }
+        const message = String(result.error?.message || "");
+        if (/pending approval|inactive borrower/i.test(message)) {
+          throw new Error(PENDING_BORROWER_MESSAGE);
+        }
+        if (/already been submitted|already exists|duplicate/i.test(message)) {
+          throw new Error("This borrowed item already has a damage or loss report.");
+        }
+        if (/active borrowed item|no longer marked as borrowed/i.test(message)) {
+          throw new Error("This item is no longer available for reporting. Refresh My equipment and try again.");
+        }
+        if (/schema cache|function .* does not exist|could not find the .* function/i.test(message)) {
+          throw new Error("Damage/loss reporting is not enabled yet. Please contact an administrator.");
+        }
+        throw new Error("We couldn't send your report. Please try again or contact a property custodian.");
+      }
+      return { data: result?.data };
+    }, "Your report has been sent. Please return the item to the property custodian.");
+
+    if (completed) setReportSubmissionComplete(true);
+    return completed;
+  }
+
   async function submitRequest(event) {
     event.preventDefault();
     if (!modal || !supabase || !user) return;
@@ -1279,30 +1391,45 @@ export default function Home() {
   }
 
   async function markNotificationRead(notificationId) {
-    await runAction(
-      () => supabase.rpc("mark_notification_read", { p_notification_id: notificationId }),
+    const marked = await runAction(
+      async () => {
+        const { error: rpcError } = await supabase.rpc("mark_notification_read", { p_notification_id: notificationId });
+        if (rpcError && /notification not found|notification.*signed-in user/i.test(rpcError.message || "")) {
+          await refresh();
+          return { notice: "Notifications refreshed." };
+        }
+        if (rpcError) throw rpcError;
+        return { data: true };
+      },
       "Notification marked as read.",
     );
+    if (marked) {
+      setNotifications((current) => current.map((item) =>
+        item.notification_id === notificationId ? { ...item, is_read: true } : item));
+    }
   }
 
   async function markAllNotificationsRead() {
-    const completed = await runAction(async () => {
-      const { data, error: markError } = await supabase.rpc("mark_all_notifications_read");
-      if (markError) throw markError;
-      const { count, error: verifyError } = await supabase.from("notifications")
-        .select("notification_id", { count: "exact", head: true })
-        .eq("is_read", false);
-      if (verifyError) throw verifyError;
-      if (typeof count !== "number" || count > 0) {
-        throw new Error("Some notifications are still unread. Please try again.");
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const { error: rpcError } = await supabase.rpc("mark_all_notifications_read");
+      if (rpcError) {
+        console.error("Notifications could not be marked as read:", rpcError);
+        setError("Notifications could not be marked as read. Please try again.");
+        return;
       }
-      return { data };
-    },
-      "All notifications marked as read.",
-    );
-    if (completed) {
+
       setNotifications((current) => current.map((item) => ({ ...item, is_read: true })));
       setUnreadNotificationCount(0);
+      setNotice("Existing notifications marked as read.");
+      await refresh();
+    } catch (actionError) {
+      console.error("Notifications could not be marked as read:", actionError);
+      setError("Notifications could not be marked as read. Please try again.");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -1529,7 +1656,9 @@ export default function Home() {
   const displayName = profile?.display_name || user.user_metadata?.display_name || user.email?.split("@")[0] || "Member";
   const userRole = profile?.role || "unavailable";
 
-  const sectionHeader = {
+  const sectionHeader = view === "reports" && !isEquipmentManager
+    ? ["Borrowed item", "Report Damaged / Lost", "Send the item details to the property custodian."]
+    : {
     overview: ["Good day", displayName, "Here’s what’s happening with your team’s equipment."],
     equipment: ["Equipment library", "Find the right gear", "Browse available equipment or check when an item is due back."],
     loans: ["Your activity", "My equipment", "Track borrowing requests, reservations, due dates, and returns."],
@@ -1540,37 +1669,22 @@ export default function Home() {
     members: ["Operations", "Members & roles", "Review account access and keep member permissions up to date."],
     feedback: ["Have a say", "Feedback & ideas", "Share improvements and discuss how the system should grow."],
     account: ["Your profile", "Account settings", "Keep your name and department information up to date."],
-  }[view] || ["Workspace", "Equipment", "Manage equipment and requests."];
+    }[view] || ["Workspace", "Equipment", "Manage equipment and requests."];
+  const showErrorBanner = error && (
+    view !== "overview" || error !== "Some information could not be loaded. Please try again."
+  );
 
-  const myBorrowings = borrowings
-    .filter((item) =>
-      Number(item.borrower_id) === Number(borrowerId) && ACTIVE_BORROWING.includes(item.status))
-    .map((item) => {
-      const borrowingItems = getBorrowerActivityItems(item.borrowing_items);
-      if (["released", "overdue", "return_requested"].includes(item.status) && !borrowingItems.length) {
-        return null;
-      }
-      const firstEquipmentItem = borrowingItems[0]?.equipment;
-      const equipmentNames = borrowingItems.map((borrowingItem) => borrowingItem.equipment?.equipment_name).filter(Boolean);
-      const assetCodes = borrowingItems.map((borrowingItem) => borrowingItem.equipment?.asset_code).filter(Boolean);
-      return {
-        ...item,
-        borrowing_items: borrowingItems,
-        equipment: firstEquipmentItem ? {
-          id: firstEquipmentItem.equipment_id,
-          name: equipmentNames.join(", "),
-          asset_tag: assetCodes.join(", "),
-          category: displayEquipmentCategory(firstEquipmentItem.categories?.category_name),
-        } : null,
-        equipment_items: equipmentNames,
-        quantity: borrowingItems.reduce((total, borrowingItem) => total + Number(borrowingItem.quantity || 1), 0),
-      };
-    })
-    .filter(Boolean);
+  const myBorrowings = borrowings.filter((item) =>
+    Number(item.borrower_id) === Number(borrowerId) && ACTIVE_BORROWING.includes(item.status));
   const myReservations = reservations.filter((item) =>
     item.requester_id === user.id
       && ["pending", "approved"].includes(item.status)
       && isManilaDateTimeCurrent(item.end_date, item.end_time));
+  const borrowerReportBorrowing = myBorrowings.find((borrowing) =>
+    borrowing.borrowing_items?.some((item) =>
+      String(item.borrowing_item_id) === String(reportBorrowingItemId)));
+  const borrowerReportItem = borrowerReportBorrowing?.borrowing_items?.find((item) =>
+    String(item.borrowing_item_id) === String(reportBorrowingItemId));
   const visibleNavItems = isAdmin
     ? ADMIN_NAV_ITEMS
     : isPropertyCustodian
@@ -1693,10 +1807,10 @@ export default function Home() {
             <div className="pending-borrower-notice" role="status">{PENDING_BORROWER_MESSAGE}</div>
           )}
 
-          {(error || notice) && (
-            <div className={`banner ${error ? "banner-error" : "banner-success"}`} role={error ? "alert" : "status"}>
-              <span>{error ? error : notice}</span>
-              {error && <button onClick={() => setError("")} aria-label="Dismiss error"><X size={16} /></button>}
+          {(showErrorBanner || notice) && (
+            <div className={`banner ${showErrorBanner ? "banner-error" : "banner-success"}`} role={showErrorBanner ? "alert" : "status"}>
+              <span>{showErrorBanner ? error : notice}</span>
+              {showErrorBanner && <button onClick={() => setError("")} aria-label="Dismiss error"><X size={16} /></button>}
             </div>
           )}
 
@@ -1783,15 +1897,7 @@ export default function Home() {
                 onPageChange={setBorrowingsPage}
                 onRequestReturn={(row) => runAction(() => supabase.rpc("request_equipment_return", { p_borrowing_id: row.id }), "Return request submitted.")}
                 onCancelRequest={(row) => runAction(() => supabase.rpc("cancel_my_pending_borrowing", { p_borrowing_id: row.id }), "Borrowing request cancelled.")}
-                onReportCondition={(borrowingItem, reportType, description, quantity) => runAction(
-                  () => supabase.rpc("report_borrowing_item_condition", {
-                    p_borrowing_item_id: borrowingItem.borrowing_item_id,
-                    p_report_type: reportType,
-                    p_description: description,
-                    p_quantity_affected: quantity,
-                  }),
-                  "Damage/loss report submitted.",
-                )}
+                onReportCondition={openBorrowerDamageReport}
                 busy={busy}
                 loading={loading}
               />
@@ -1852,6 +1958,18 @@ export default function Home() {
           )}
 
           {view === "reports" && isEquipmentManager && <ReportsWorkspace supabase={supabase} initialReportId={selectedReport} />}
+
+          {view === "reports" && !isEquipmentManager && !isPendingBorrower && (
+            <BorrowerDamageLossWorkspace
+              borrowing={borrowerReportBorrowing}
+              borrowingItem={borrowerReportItem}
+              loading={loading}
+              busy={busy}
+              submitted={reportSubmissionComplete}
+              onSubmit={submitBorrowerDamageReport}
+              onBack={() => setView("loans")}
+            />
+          )}
 
           {view === "audit-log" && isAdmin && <AuditLogWorkspace supabase={supabase} isAdmin={isAdmin} />}
 
@@ -2028,13 +2146,14 @@ function BorrowingList({ rows, onRequestReturn, onCancelRequest, onReportConditi
             {item.status === "return_requested" && <span className="return-note"><Clock3 size={14} /> Return requested</span>}
           </div>
           {["released", "overdue", "return_requested"].includes(item.status) && (item.borrowing_items || [])
-            .filter((borrowingItem) => borrowingItem.item_status === "released")
-            .map((borrowingItem) => <BorrowingConditionReportForm
-              key={borrowingItem.borrowing_item_id}
-              borrowingItem={borrowingItem}
-              busy={busy}
-              onSubmit={onReportCondition}
-            />)}
+            .filter((borrowingItem) => borrowingItem.item_status === "released" && !borrowingItem.hasDamageLossReport)
+            .map((borrowingItem) => (
+              <div className="borrower-condition-report" key={borrowingItem.borrowing_item_id}>
+                <button className="button-secondary" type="button" onClick={() => onReportCondition(borrowingItem)} disabled={busy}>
+                  Report Damaged / Lost
+                </button>
+              </div>
+            ))}
         </article>
       ))}
       <nav className="unit-pagination" aria-label="Current borrowing pages"><span>Page {page + 1}</span><div><button className="button-secondary" type="button" onClick={() => onPageChange(Math.max(0, page - 1))} disabled={page === 0}><ArrowLeft size={14} /> Previous</button><button className="button-secondary" type="button" onClick={() => onPageChange(page + 1)} disabled={!hasMore}>Next <ArrowRight size={14} /></button></div></nav>
@@ -2042,38 +2161,67 @@ function BorrowingList({ rows, onRequestReturn, onCancelRequest, onReportConditi
   );
 }
 
-function BorrowingConditionReportForm({ borrowingItem, busy, onSubmit }) {
-  const [open, setOpen] = useState(false);
+function BorrowerDamageLossWorkspace({ borrowing, borrowingItem, loading, busy, submitted, onSubmit, onBack }) {
   const [reportType, setReportType] = useState("damage");
-  const [quantity, setQuantity] = useState("1");
   const [description, setDescription] = useState("");
+  const formRef = useRef(null);
 
   async function submit(event) {
     event.preventDefault();
-    const saved = await onSubmit(borrowingItem, reportType, description.trim(), Number(quantity));
+    if (!borrowingItem || borrowingItem.hasDamageLossReport) return;
+    const saved = await onSubmit(
+      borrowingItem,
+      reportType,
+      description.trim(),
+      formRef.current?.elements.namedItem("report_photo")?.files?.[0] || null,
+    );
     if (saved) {
+      setReportType("damage");
       setDescription("");
-      setQuantity("1");
-      setOpen(false);
+      formRef.current?.reset();
     }
   }
 
-  const itemName = borrowingItem.equipment?.equipment_name || "Borrowed equipment";
-  const maxQuantity = Number(borrowingItem.quantity || 1);
+  const itemName = borrowingItem?.equipment?.equipment_name || "Borrowed equipment";
+  const quantity = Number(borrowingItem?.original_quantity || borrowingItem?.quantity || 1);
   return (
-    <div className="borrower-condition-report">
-      <button className="button-secondary" type="button" onClick={() => setOpen((current) => !current)} disabled={busy}>
-        {open ? "Cancel report" : `Report damage or loss · ${itemName}`}
-      </button>
-      {open && <form className="borrower-condition-report-form" onSubmit={submit}>
-        <label><span>Report type</span><select value={reportType} onChange={(event) => setReportType(event.target.value)} disabled={busy}>
-          <option value="damage">Damaged</option>
-          <option value="loss">Lost</option>
-        </select></label>
-        {maxQuantity > 1 && <label><span>Quantity affected</span><input type="number" min="1" max={maxQuantity} value={quantity} onChange={(event) => setQuantity(event.target.value)} required disabled={busy} /> <small>Up to {maxQuantity} borrowed items.</small></label>}
-        <label><span>Details</span><textarea value={description} onChange={(event) => setDescription(event.target.value)} rows="2" maxLength={2000} required disabled={busy} /></label>
-        <button className="button-primary" type="submit" disabled={busy || !description.trim()}>{busy ? "Submitting…" : "Submit report"}</button>
-      </form>}
+    <div className="borrower-report-workspace">
+      <button className="button-secondary" type="button" onClick={onBack}>Back to My equipment</button>
+      {submitted ? (
+        <div className="borrower-report-success" role="status">
+          Your report has been sent. Please return the item to the property custodian.
+        </div>
+      ) : loading && !borrowingItem ? (
+        <LoadingPanel />
+      ) : !borrowingItem || !borrowing ? (
+        <div className="borrower-report-card">
+          <p>This borrowed item is no longer available for reporting. Return to My equipment and choose a current item.</p>
+        </div>
+      ) : borrowingItem.hasDamageLossReport ? (
+        <div className="borrower-report-card">
+          <p>This borrowed item already has a damage or loss report.</p>
+        </div>
+      ) : (
+        <section className="borrower-report-card">
+          <div className="phase7-section-heading">
+            <div><h2>{itemName}</h2><p>Report the condition of an item you currently hold.</p></div>
+          </div>
+          <dl className="borrower-report-details">
+            <div><dt>Borrower</dt><dd>{borrowing.borrower_name || "Borrower"}</dd></div>
+            <div><dt>Quantity</dt><dd>{quantity}</dd></div>
+            <div><dt>Borrowing record</dt><dd>{borrowing.id}</dd></div>
+          </dl>
+          <form ref={formRef} className="borrower-condition-report-form" onSubmit={submit}>
+            <label><span>Report type</span><select name="report_type" value={reportType} onChange={(event) => setReportType(event.target.value)} disabled={busy}>
+              <option value="damage">Damaged</option>
+              <option value="loss">Lost</option>
+            </select></label>
+            <label><span>Description</span><textarea name="description" value={description} onChange={(event) => setDescription(event.target.value)} rows="4" maxLength={2000} required disabled={busy} /></label>
+            <label><span>Photo (optional)</span><input name="report_photo" type="file" accept="image/jpeg,image/png,image/webp" disabled={busy} /><small>JPEG, PNG, or WebP; up to 5 MB.</small></label>
+            <button className="button-primary" type="submit" disabled={busy || !description.trim()}>{busy ? "Sending…" : "Send report"}</button>
+          </form>
+        </section>
+      )}
     </div>
   );
 }
@@ -2144,6 +2292,7 @@ function ReservationList({ rows, loading, admin = false, onCancel }) {
 
 function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSearchChange, page, hasMore, onPageChange, busy, runAction, supabase, canReview, userId }) {
   const [pickupGraceMinutes, setPickupGraceMinutes] = useState("");
+  const [currentTime, setCurrentTime] = useState(() => Date.now());
   const [settingsError, setSettingsError] = useState("");
   const [workflowError, setWorkflowError] = useState("");
   const [overdueItems, setOverdueItems] = useState([]);
@@ -2156,6 +2305,10 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
   const matchesBorrower = (name, email) => !query
     || `${name || ""} ${email || ""}`.toLocaleLowerCase().includes(query)
     || String(name || "").toLocaleLowerCase().split(/\s+/).some((part) => part.startsWith(query));
+  useEffect(() => {
+    const timer = window.setInterval(() => setCurrentTime(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
   useEffect(() => {
     if (!canReview) return undefined;
     let active = true;
@@ -2517,7 +2670,7 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
           {approvedReservations.map((item) => (
             <article className="admin-request" key={item.id}>
               <span className="reservation-icon"><CalendarDays size={19} /></span>
-              <div className="admin-request-main"><div className="loan-card-heading"><span className="card-category">{item.equipment?.asset_tag}</span><StatusPill value={item.status} /></div><h2>{item.equipment?.name || "Equipment"}</h2><p>{item.requester_name} · {item.requester_email || item.requester_id} · {item.quantity || 1} {Number(item.quantity || 1) === 1 ? "item" : "items"} · {item.purpose}</p><small>{dateLabel(item.start_date)} – {dateLabel(item.end_date)} · {item.location_of_use}</small></div>
+              <div className="admin-request-main"><div className="loan-card-heading"><span className="card-category">{item.equipment?.asset_tag}</span><StatusPill value={item.start_date && item.start_time && !isManilaDateTimeCurrent(item.start_date, item.start_time, new Date(currentTime)) ? "pickup_delayed" : item.status} /></div><h2>{item.equipment?.name || "Equipment"}</h2><p>{item.requester_name} · {item.requester_email || item.requester_id} · {item.quantity || 1} {Number(item.quantity || 1) === 1 ? "item" : "items"} · {item.purpose}</p><small>{dateLabel(item.start_date)} – {dateLabel(item.end_date)} · {item.location_of_use}</small></div>
               {canReview && <div className="admin-actions">
                 <button className="button-primary" disabled={busy} onClick={() => runAction(
                   () => supabase.rpc("mark_reservation_picked_up", { p_reservation_id: item.id }),

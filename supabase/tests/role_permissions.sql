@@ -7,6 +7,7 @@ declare
   v_custodian uuid;
   v_staff uuid;
   v_staff_email text;
+  v_staff_name text;
   v_category_id bigint;
   v_equipment_id bigint;
 begin
@@ -26,6 +27,18 @@ begin
   if not has_function_privilege('authenticated', 'public.set_profile_role(uuid, text)', 'execute') then
     raise exception 'Authenticated administrators must retain role-assignment access.';
   end if;
+  if not has_function_privilege(
+      'authenticated',
+      'public.report_borrowing_item_condition_with_photo(bigint, text, text, integer, text)',
+      'execute'
+    )
+    or has_function_privilege(
+      'authenticated',
+      'public.report_borrowing_item_condition(bigint, text, text, integer)',
+      'execute'
+    ) then
+    raise exception 'Borrower damage/loss reports must use the owner-checked submission RPC.';
+  end if;
 
   select p.id into v_admin
   from public.profiles p
@@ -44,6 +57,10 @@ begin
   where p.role = 'staff' and p.account_status = 'active' and b.status = 'active'
     and u.email_confirmed_at is not null
   order by p.created_at limit 1;
+  select concat_ws(' ', b.first_name, b.middle_name, b.last_name)
+  into v_staff_name
+  from public.borrowers b
+  where b.user_id = v_staff;
   select c.category_id into v_category_id from public.categories c order by c.category_id limit 1;
   if v_admin is null or v_custodian is null or v_staff is null or v_category_id is null then
     raise exception 'Role permission tests require active admin, property custodian, borrower, and category fixtures.';
@@ -57,6 +74,7 @@ begin
   perform set_config('role_permissions.custodian_id', v_custodian::text, true);
   perform set_config('role_permissions.staff_id', v_staff::text, true);
   perform set_config('role_permissions.staff_email', v_staff_email, true);
+  perform set_config('role_permissions.staff_name', v_staff_name, true);
   perform set_config('role_permissions.equipment_id', v_equipment_id::text, true);
 end;
 $$;
@@ -75,6 +93,7 @@ declare
   v_staff uuid := current_setting('role_permissions.staff_id')::uuid;
   v_admin uuid := current_setting('role_permissions.admin_id')::uuid;
   v_staff_email text := current_setting('role_permissions.staff_email');
+  v_staff_name text := current_setting('role_permissions.staff_name');
   v_rows integer;
   v_custodian_equipment_id bigint;
   v_unit_id bigint;
@@ -209,25 +228,72 @@ begin
   perform set_config('request.jwt.claims', jsonb_build_object(
     'sub', v_staff, 'email', v_staff_email, 'role', 'authenticated'
   )::text, true);
-  v_report_id := public.report_borrowing_item_condition(
-    v_item_id, 'damage', 'Borrower-reported damage for permission test', 1
+  v_report_id := public.report_borrowing_item_condition_with_photo(
+    v_item_id, 'damage', 'Borrower-reported damage for permission test', 1, null
   );
   if not exists (
     select 1 from public.damage_loss_reports
     where report_id = v_report_id and reporter_id = v_staff
       and report_type = 'damage'
       and description = 'Borrower-reported damage for permission test'
-      and resolution_status = 'open'
   ) then raise exception 'A borrower could not submit a damage report for their active item.'; end if;
+  if not exists (
+    select 1
+    from public.notifications n
+    where n.user_id = v_admin
+      and n.borrowing_id = v_borrowing_id
+      and n.notification_type = 'damage_report_created'
+      and n.message like '%' || v_staff_name || '%'
+      and n.message like '%Role permission test equipment%'
+      and n.message like '%damaged%'
+      and n.message ~ '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}'
+  ) or not exists (
+    select 1
+    from public.notifications n
+    where n.user_id = v_custodian
+      and n.borrowing_id = v_borrowing_id
+      and n.notification_type = 'damage_report_created'
+      and n.message like '%' || v_staff_name || '%'
+      and n.message like '%Role permission test equipment%'
+      and n.message like '%damaged%'
+  ) then raise exception 'A damage report did not create detailed notifications for every active manager.'; end if;
+  perform set_config('request.jwt.claim.sub', v_admin::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object('sub', v_admin, 'role', 'authenticated')::text, true);
+  perform public.mark_all_notifications_read();
+  if exists (
+    select 1 from public.notifications
+    where user_id = v_admin and borrowing_id = v_borrowing_id and not is_read
+  ) or not exists (
+    select 1 from public.notifications
+    where user_id = v_custodian and borrowing_id = v_borrowing_id and not is_read
+  ) then raise exception 'Mark all read did not update only the administrator''s notifications.'; end if;
+  perform set_config('request.jwt.claim.sub', v_custodian::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object('sub', v_custodian, 'role', 'authenticated')::text, true);
+  perform public.mark_all_notifications_read();
+  if exists (
+    select 1 from public.notifications
+    where user_id = v_custodian and borrowing_id = v_borrowing_id and not is_read
+  ) then raise exception 'Mark all read did not update the property custodian''s notifications.'; end if;
+  if not exists (
+    select 1
+    from public.borrowing_items bi
+    join public.borrowings b using (borrowing_id)
+    join public.equipment_units u using (unit_id)
+    where bi.borrowing_item_id = v_item_id
+      and bi.item_status = 'returned'
+      and bi.condition_at_return = 'damaged'
+      and b.transaction_status = 'returned'
+      and u.status = 'maintenance'
+  ) then raise exception 'A borrower damage report did not complete tracking or make its unit unavailable.'; end if;
   begin
-    perform public.report_borrowing_item_condition(
-      v_item_id, 'damage', 'Duplicate open report', 1
+    perform public.report_borrowing_item_condition_with_photo(
+      v_item_id, 'damage', 'Duplicate open report', 1, null
     );
-    raise exception 'A borrower created a duplicate unresolved report.';
+    raise exception 'A borrower submitted another report after the borrowing was complete.';
   exception when raise_exception then
     get stacked diagnostics v_error = message_text;
-    if v_error = 'A borrower created a duplicate unresolved report.' then raise; end if;
-    if v_error not like '%unresolved report of this type already exists%' then raise; end if;
+    if v_error = 'A borrower submitted another report after the borrowing was complete.' then raise; end if;
+    if v_error not like '%already been submitted%' then raise; end if;
   end;
 
   perform set_config('request.jwt.claim.sub', v_custodian::text, true);
@@ -240,6 +306,28 @@ begin
     where report_id = v_report_id
       and description = 'Borrower-reported damage for permission test'
   ) then raise exception 'A manager could not load the borrower comment in damage and loss reports.'; end if;
+
+  perform set_config('request.jwt.claim.sub', v_staff::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object(
+    'sub', v_staff, 'email', v_staff_email, 'role', 'authenticated'
+  )::text, true);
+  v_borrowing_id := public.request_equipment_borrowing(
+    v_equipment_id, 'Return permission test', 'Role test location', now() + interval '4 days', 1
+  );
+  select borrowing_item_id into v_item_id
+  from public.borrowing_items where borrowing_id = v_borrowing_id;
+  select asset_tag into v_asset_tag from public.equipment_units where unit_id = v_second_unit_id;
+
+  perform set_config('request.jwt.claim.sub', v_custodian::text, true);
+  perform set_config('request.jwt.claims', jsonb_build_object(
+    'sub', v_custodian, 'role', 'authenticated'
+  )::text, true);
+  perform public.review_borrowing_request(v_borrowing_id, 'approve', null);
+  perform public.release_equipment_borrowing_units(
+    v_borrowing_id,
+    jsonb_build_array(jsonb_build_object('borrowing_item_id', v_item_id, 'unit_id', v_second_unit_id)),
+    'good'
+  );
   begin
     perform public.complete_equipment_unit_return(v_item_id, 'good', v_asset_tag, null, null);
     raise exception 'A property custodian returned equipment without a borrower request.';
