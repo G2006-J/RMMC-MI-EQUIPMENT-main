@@ -603,8 +603,8 @@ export default function Home() {
   useEffect(() => {
     try {
       setSupabase(createClient());
-    } catch (clientError) {
-      console.error("The Supabase client could not be initialized:", clientError);
+    } catch {
+      console.error("The Supabase client could not be initialized.");
       setConfigError("The sign-in service is unavailable right now. Please try again later.");
       setLoading(false);
     }
@@ -657,8 +657,8 @@ export default function Home() {
       setActiveAgreement(null);
       setAcceptedAgreementVersion(null);
       setBorrowerId(null);
-      if (profileResult.error) console.error("The profile could not be loaded:", profileResult.error);
-      if (stateResult?.error) console.error("The account state could not be verified:", stateResult.error);
+      if (profileResult.error) console.error("The profile could not be loaded.");
+      if (stateResult?.error) console.error("The account state could not be verified.");
       setError(profileResult.error
         ? "Your account information could not be loaded. Please try again."
         : stateResult?.error
@@ -680,7 +680,7 @@ export default function Home() {
     if (currentProfile.role === "staff") {
       const stateResult = await client.rpc("get_my_account_state");
       if (stateResult.error) {
-        console.error("The account state could not be verified:", stateResult.error);
+        console.error("The account state could not be verified.");
       } else if (["pending", "active", "inactive"].includes(stateResult.data)) {
         currentProfile.account_status = stateResult.data;
       }
@@ -715,8 +715,8 @@ export default function Home() {
         client.from("notifications").select("notification_id", { count: "exact", head: true }).eq("is_read", false),
       ]);
       if (inactiveNotificationsResult.error || inactiveUnreadResult.error) {
-        if (inactiveNotificationsResult.error) console.error("Account notifications could not be loaded:", inactiveNotificationsResult.error);
-        if (inactiveUnreadResult.error) console.error("The unread notification count could not be loaded:", inactiveUnreadResult.error);
+        if (inactiveNotificationsResult.error) console.error("Account notifications could not be loaded.");
+        if (inactiveUnreadResult.error) console.error("The unread notification count could not be loaded.");
         setError("Notifications are unavailable right now.");
       } else {
         setNotifications(inactiveNotificationsResult.data || []);
@@ -1039,7 +1039,7 @@ export default function Home() {
       setPendingAccounts([]);
     }
     if (errors.length) {
-      errors.forEach(([context, loadError]) => console.error(context, loadError));
+      errors.forEach(([context]) => console.error(context));
       if (!borrowerMissing) setError("Some information could not be loaded. Please try again.");
     }
     if (borrowerMissing) setError(PENDING_BORROWER_MESSAGE);
@@ -1103,13 +1103,13 @@ export default function Home() {
         ]);
         if (!active) return;
         if (borrowingCount.error || reservationCount.error) {
-          if (borrowingCount.error) console.error("Pending borrowing request count could not be loaded:", borrowingCount.error);
-          if (reservationCount.error) console.error("Pending reservation request count could not be loaded:", reservationCount.error);
+          if (borrowingCount.error) console.error("Pending borrowing request count could not be loaded.");
+          if (reservationCount.error) console.error("Pending reservation request count could not be loaded.");
           return;
         }
         setPendingRequestCount((borrowingCount.count || 0) + (reservationCount.count || 0));
-      } catch (countError) {
-        if (active) console.error("Pending request counts could not be loaded:", countError);
+      } catch {
+        if (active) console.error("Pending request counts could not be loaded.");
       }
     }
 
@@ -1129,12 +1129,12 @@ export default function Home() {
         const { data: accountState, error: stateError } = await supabase.rpc("get_my_account_state");
         if (!active) return;
         if (stateError) {
-          console.error("The pending borrower account state could not be refreshed:", stateError);
+          console.error("The pending borrower account state could not be refreshed.");
           return;
         }
         if (["active", "inactive"].includes(accountState)) await loadData(supabase, user);
-      } catch (stateError) {
-        if (active) console.error("The pending borrower account state could not be refreshed:", stateError);
+      } catch {
+        if (active) console.error("The pending borrower account state could not be refreshed.");
       }
     }
     const interval = window.setInterval(refreshPendingAccountState, 60_000);
@@ -1255,7 +1255,7 @@ export default function Home() {
         try {
           photoPath = await uploadItemConditionPhoto(supabase, user.id, photoFile, "report photo");
         } catch (photoError) {
-          console.error("The borrower report photo could not be uploaded:", photoError);
+          console.error("The borrower report photo could not be uploaded.");
           const validationMessage = photoError instanceof Error
             && /JPEG|PNG|WebP|5 MB|valid image|processed/i.test(photoError.message)
             ? photoError.message
@@ -1279,18 +1279,13 @@ export default function Home() {
         result = { error: reportError };
       }
       if (result?.error) {
-        console.error("The borrower damage/loss report request returned an error:", {
-          code: result.error.code,
-          message: result.error.message,
-          details: result.error.details,
-          hint: result.error.hint,
-        });
+        console.error("The borrower damage/loss report request returned an error.");
         if (photoPath && !rpcResponseUncertain) {
           const { error: cleanupError } = await supabase.storage
             .from("item-condition-photos")
             .remove([photoPath]);
           if (cleanupError) {
-            console.error("The failed borrower report photo could not be removed:", cleanupError);
+            console.error("The failed borrower report photo could not be removed.");
             throw new Error("The report could not be saved and its photo could not be removed. Contact a property custodian.");
           }
         }
@@ -1421,7 +1416,7 @@ export default function Home() {
     try {
       const { error: rpcError } = await supabase.rpc("mark_all_notifications_read");
       if (rpcError) {
-        console.error("Notifications could not be marked as read:", rpcError);
+        console.error("Notifications could not be marked as read.");
         setError("Notifications could not be marked as read. Please try again.");
         return;
       }
@@ -1430,8 +1425,8 @@ export default function Home() {
       setUnreadNotificationCount(0);
       setNotice("Existing notifications marked as read.");
       await refresh();
-    } catch (actionError) {
-      console.error("Notifications could not be marked as read:", actionError);
+    } catch {
+      console.error("Notifications could not be marked as read.");
       setError("Notifications could not be marked as read. Please try again.");
     } finally {
       setBusy(false);
@@ -1451,7 +1446,10 @@ export default function Home() {
         cacheControl: "3600",
       });
     if (uploadError) throw uploadError;
-    return supabase.storage.from("equipment-images").getPublicUrl(path).data.publicUrl;
+    return {
+      path,
+      publicUrl: supabase.storage.from("equipment-images").getPublicUrl(path).data.publicUrl,
+    };
   }
 
   async function uploadProfilePhoto(file) {
@@ -1486,9 +1484,26 @@ export default function Home() {
       condition_status: "good",
     };
     await runAction(async () => {
-      const imageUrl = await uploadEquipmentImage(form);
-      const { error: insertError } = await supabase.from("equipment").insert({ ...item, image_url: imageUrl });
+      const uploadedImage = await uploadEquipmentImage(form);
+      const { data: insertedRows, error: insertError } = await supabase
+        .from("equipment")
+        .upsert(
+          { ...item, image_url: uploadedImage?.publicUrl || null },
+          { onConflict: "asset_code", ignoreDuplicates: true },
+        )
+        .select("equipment_id");
       if (insertError) throw insertError;
+      if (!insertedRows?.length) {
+        if (uploadedImage) {
+          const { error: cleanupError } = await supabase.storage
+            .from("equipment-images")
+            .remove([uploadedImage.path]);
+          if (cleanupError) {
+            throw new Error("That asset code is already in use. The uploaded picture could not be removed; please contact an administrator.");
+          }
+        }
+        throw new Error("An equipment record with this asset code already exists. Choose a different asset code.");
+      }
     }, "Equipment added to inventory.");
   }
 
@@ -1511,8 +1526,8 @@ export default function Home() {
       updated_at: new Date().toISOString(),
     };
     await runAction(async () => {
-      const imageUrl = await uploadEquipmentImage(form);
-      if (imageUrl) item.image_url = imageUrl;
+      const uploadedImage = await uploadEquipmentImage(form);
+      if (uploadedImage) item.image_url = uploadedImage.publicUrl;
       else if (form.get("remove_image") === "on") item.image_url = null;
       const { error: updateError } = await supabase.from("equipment").update(item).eq("equipment_id", modal.item.id);
       if (updateError) throw updateError;
@@ -1548,7 +1563,7 @@ export default function Home() {
           if (uploadedPath) {
             const { error: cleanupError } = await supabase.storage.from("profile-photos").remove([uploadedPath]);
             if (cleanupError) {
-              console.error("The uploaded profile photo could not be cleaned up:", cleanupError);
+              console.error("The uploaded profile photo could not be cleaned up.");
               throw new Error("The profile photo update failed and the uploaded image could not be cleaned up.");
             }
           }
@@ -1557,7 +1572,7 @@ export default function Home() {
         if (profile.profile_photo_path && profile.profile_photo_path !== newPhotoPath) {
           const { error: cleanupError } = await supabase.storage.from("profile-photos").remove([profile.profile_photo_path]);
           if (cleanupError) {
-            console.error("The previous profile photo could not be removed:", cleanupError);
+            console.error("The previous profile photo could not be removed.");
             throw new Error("Your profile was updated, but the previous photo could not be removed.");
           }
         }
@@ -2327,7 +2342,7 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
       ]);
       if (!active) return;
       if (settingsResult.error) {
-        console.error("Reservation pickup settings could not be loaded:", settingsResult.error);
+        console.error("Reservation pickup settings could not be loaded.");
         setSettingsError("Reservation pickup settings are unavailable right now.");
       } else if (!settingsResult.data) {
         setSettingsError("Reservation pickup settings are unavailable right now.");
@@ -2336,7 +2351,7 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
       }
       let hasLoadError = false;
       if (overdueResult.error) {
-        console.error("The overdue list could not be loaded:", overdueResult.error);
+        console.error("The overdue list could not be loaded.");
         hasLoadError = true;
         setOverdueItems([]);
       } else {
@@ -2349,7 +2364,7 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
             .in("borrowing_id", overdueBorrowingIds)
           : { data: [], error: null };
         if (returnRequestsResult.error) {
-          console.error("Overdue return requests could not be loaded:", returnRequestsResult.error);
+          console.error("Overdue return requests could not be loaded.");
           hasLoadError = true;
           setOverdueItems([]);
         } else {
@@ -2362,8 +2377,8 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
       }
       setWorkflowError(hasLoadError ? "Some request information is unavailable right now." : "");
     }
-    loadOperationalData().catch((loadError) => {
-      console.error("Request operations could not be loaded:", loadError);
+    loadOperationalData().catch(() => {
+      console.error("Request operations could not be loaded.");
       if (active) {
         setWorkflowError("Request information is unavailable right now.");
       }
@@ -2427,7 +2442,7 @@ function AdminRequests({ borrowings, reservations, search: borrowerSearch, onSea
             .from("item-condition-photos")
             .remove([photoPath]);
           if (cleanupError) {
-            console.error("The uploaded condition photo could not be removed:", cleanupError);
+            console.error("The uploaded condition photo could not be removed.");
             throw new Error("The action failed and the uploaded condition photo could not be removed.");
           }
         }
@@ -2734,7 +2749,7 @@ function WorkflowConditionAction({ stage, busy, onSubmit, supabase, item, refres
     supabase.rpc("list_borrowing_unit_assignments", { p_borrowing_id: item.id }).then(({ data, error }) => {
       if (!active) return;
       if (error) {
-        console.error("Unit assignments could not be loaded:", error);
+        console.error("Unit assignments could not be loaded.");
         setUnitError("Unit assignments are unavailable right now.");
       }
       else setAssignedUnits((data || []).filter((assignment) => assignment.unit_status === "borrowed"));
@@ -2748,7 +2763,7 @@ function WorkflowConditionAction({ stage, busy, onSubmit, supabase, item, refres
     setUnitError("");
     const { data, error } = await supabase.rpc("lookup_equipment_unit_by_tag", { p_asset_tag: assetTag });
     if (error) {
-      console.error("The equipment unit could not be found:", error);
+      console.error("The equipment unit could not be found.");
       setUnitError("The equipment unit could not be found. Check the asset tag and try again.");
       return;
     }
@@ -2929,8 +2944,8 @@ function UnitTagField({ label, value, disabled, onChange, onLookup }) {
           animationFrame = window.requestAnimationFrame(detectFrame);
         };
         detectFrame();
-      } catch (scanError) {
-        console.error("QR scanner could not access the camera:", scanError);
+      } catch {
+        console.error("QR scanner could not access the camera.");
         setCameraError("Camera access failed. Enter the asset tag manually.");
         setCameraOpen(false);
       }

@@ -1,6 +1,27 @@
+import { createHash } from "node:crypto";
+import os from "node:os";
+import path from "node:path";
+
 /** @type {import('next').NextConfig} */
+const projectDir = process.cwd();
+const isOneDriveWorkspace =
+  process.platform === "win32" &&
+  projectDir.split(path.sep).some((segment) => /^OneDrive(?:\s*-\s.*)?$/i.test(segment));
+const outputDir = process.env.NODE_ENV === "development" ? ".next-dev" : ".next";
+const distDir = isOneDriveWorkspace
+  ? path.relative(
+      projectDir,
+      path.join(
+        process.env.LOCALAPPDATA || os.tmpdir(),
+        "rmmc-mi-equipment-next",
+        createHash("sha256").update(projectDir.toLowerCase()).digest("hex").slice(0, 12),
+        outputDir,
+      ),
+    )
+  : outputDir;
+
 const nextConfig = {
-  distDir: process.env.NODE_ENV === "development" ? ".next-dev" : ".next",
+  distDir,
   devIndicators: false,
   poweredByHeader: false,
   productionBrowserSourceMaps: false,

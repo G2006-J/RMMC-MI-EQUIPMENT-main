@@ -127,18 +127,6 @@ async function loadReportRows(supabase, reportId, startDate, endDate) {
   return { rows, totalCount };
 }
 
-function formatLoadError(error) {
-  const message = typeof error?.message === "string" && error.message.trim()
-    ? error.message.trim()
-    : "Unknown backend error.";
-  const diagnostics = [
-    typeof error?.code === "string" && error.code.trim() ? `code: ${error.code.trim()}` : "",
-    typeof error?.details === "string" && error.details.trim() ? `details: ${error.details.trim()}` : "",
-    typeof error?.hint === "string" && error.hint.trim() ? `hint: ${error.hint.trim()}` : "",
-  ].filter(Boolean).join("; ");
-  return `${message}${diagnostics ? ` (${diagnostics})` : ""}`;
-}
-
 function MetricCard({ label, value, detail, Icon, color }) {
   return (
     <article className="metric-card">
@@ -167,8 +155,8 @@ export function OverviewReportCards({ supabase, onSelectReport }) {
       try {
         const report = await loadReportRows(supabase, id, startDate, endDate);
         if (active) setResults((current) => ({ ...current, [id]: { loading: false, ...report } }));
-      } catch (reportError) {
-        console.error(`The ${id} overview report could not be loaded:`, reportError);
+      } catch {
+        console.error(`The ${id} overview report could not be loaded.`);
         if (active) setResults((current) => ({ ...current, [id]: { loading: false, error: true } }));
       }
     });
@@ -234,8 +222,8 @@ export function OverviewStatistics({ supabase, isManager, borrowerId, pendingReq
           Promise.all(reportCalls.map(async ([id, start, end]) => {
             try {
               return [id, await loadReport(supabase, id, start, end)];
-            } catch (reportError) {
-              console.error(`The ${id} overview statistic could not be loaded:`, reportError);
+            } catch {
+              console.error(`The ${id} overview statistic could not be loaded.`);
               return [id, null];
             }
           })),
@@ -245,8 +233,8 @@ export function OverviewStatistics({ supabase, isManager, borrowerId, pendingReq
           supabase.rpc("list_damage_loss_reports"),
         ]);
         if (!active) return;
-        if (borrowedResult.error) console.error("The currently borrowed count could not be loaded:", borrowedResult.error);
-        if (damageLossResult.error) console.error("The damaged and lost item counts could not be loaded:", damageLossResult.error);
+        if (borrowedResult.error) console.error("The currently borrowed count could not be loaded.");
+        if (damageLossResult.error) console.error("The damaged and lost item counts could not be loaded.");
         const reportData = Object.fromEntries(reports);
         const damageLossReports = damageLossResult.error || !Array.isArray(damageLossResult.data)
           ? null
@@ -286,16 +274,16 @@ export function OverviewStatistics({ supabase, isManager, borrowerId, pendingReq
           .eq("borrowing_items.is_overdue", true),
       ]);
       if (!active) return;
-      if (activeBorrowings.error) console.error("The borrower active-borrowing count could not be loaded:", activeBorrowings.error);
-      if (overdueBorrowings.error) console.error("The borrower overdue count could not be loaded:", overdueBorrowings.error);
+      if (activeBorrowings.error) console.error("The borrower active-borrowing count could not be loaded.");
+      if (overdueBorrowings.error) console.error("The borrower overdue count could not be loaded.");
       setStatistics({
         activeBorrowings: activeBorrowings.error ? null : activeBorrowings.count || 0,
         overdue: overdueBorrowings.error ? null : overdueBorrowings.count || 0,
       });
     }
 
-    loadStatistics().catch((loadError) => {
-      console.error("Overview statistics could not be loaded:", loadError);
+    loadStatistics().catch(() => {
+      console.error("Overview statistics could not be loaded.");
       if (active) setStatistics({});
     });
     return () => { active = false; };
@@ -340,8 +328,7 @@ export function ReportsWorkspace({ supabase, initialReportId = "utilization" }) 
     setError("");
     loadReport(supabase, activeReportId, startDate, endDate, pages[activeReportId] || 0).then((data) => {
       if (active) setReports((current) => ({ ...current, [activeReportId]: data }));
-    }).catch((loadError) => {
-      console.error(`Reports could not be loaded: ${formatLoadError(loadError)}`);
+    }).catch(() => {
       if (active) setError("Reports are unavailable right now.");
     }).finally(() => {
       if (active) setLoading(false);
@@ -385,8 +372,8 @@ export function ReportsWorkspace({ supabase, initialReportId = "utilization" }) 
       setNotice(data.truncated
         ? `PDF print view opened. It includes the first 5,000 rows; ${data.total_count - 5000} additional rows were not included.`
         : `PDF print view opened for ${report.title} (${rows.length} rows). Choose Save as PDF to download it.`);
-    } catch (exportError) {
-      console.error("The report export could not be created:", exportError);
+    } catch {
+      console.error("The report export could not be created.");
       printWindow.close();
       setError("The report export could not be created. Please try again.");
     } finally {
@@ -494,8 +481,8 @@ export function AuditLogWorkspace({ supabase, isAdmin }) {
       if (!active) return;
       if (historyError) throw historyError;
       setResult(data || { rows: [], total_count: 0 });
-    }).catch((loadError) => {
-      console.error("Audit history could not be loaded:", loadError);
+    }).catch(() => {
+      console.error("Audit history could not be loaded.");
       if (active) setError("Audit history is unavailable right now.");
     }).finally(() => {
       if (active) setLoading(false);
@@ -551,8 +538,8 @@ export function AuditLogWorkspace({ supabase, isAdmin }) {
       setNotice(data.truncated
         ? `PDF print view opened. It includes the first 5,000 rows; ${data.total_count - 5000} additional rows were not included.`
         : `PDF print view opened for ${rows.length} audit events. Choose Save as PDF to download it.`);
-    } catch (exportError) {
-      console.error("The audit export could not be created:", exportError);
+    } catch {
+      console.error("The audit export could not be created.");
       printWindow.close();
       setError("The audit export could not be created. Please try again.");
     } finally {
